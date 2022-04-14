@@ -22,7 +22,7 @@ jsonrpc-core-client = { version = "18.0.0", features = ["ipc", "ws"] }
 jsonrpc-derive = "18.0.0"
 jsonrpc-ipc-server = "18.0.0"
 jsonrpc-server-utils= "18.0.0"
-log = "0.4.14"
+log = "0.4.16"
 num_cpus = "1.13.0"
 rand = "0.7.0"
 solana-clap-utils = { path = "../clap-utils", version = "=1.9.0" }
