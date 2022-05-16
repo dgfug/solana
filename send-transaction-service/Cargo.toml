@@ -10,7 +10,7 @@ license = "Apache-2.0"
 edition = "2018"
 
 [dependencies]
-log = "0.4.14"
+log = "0.4.17"
 solana-logger = { path = "../logger", version = "=1.9.0" }
 solana-metrics = { path = "../metrics", version = "=1.9.0" }
 solana-runtime = { path = "../runtime", version = "=1.9.0" }
