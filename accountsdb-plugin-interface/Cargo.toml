@@ -10,7 +10,7 @@ homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-validator"
 
 [dependencies]
-log = "0.4.11"
+log = "0.4.17"
 thiserror = "1.0.30"
 
 [package.metadata.docs.rs]
