@@ -11,6 +11,8 @@ if [[ -n $4 ]]; then
 fi
 benchTpsExtraArgs="$5"
 clientIndex="$6"
+clientType="${7:-tpu-client}"
+maybeUseUnstakedConnection="$8"
 
 missing() {
   echo "Error: $1 not specified"
@@ -41,19 +43,48 @@ skip)
   exit 1
 esac
 
+RPC_CLIENT=false
+case "$clientType" in
+  tpu-client)
+    RPC_CLIENT=false
+    ;;
+  rpc-client)
+    RPC_CLIENT=true
+    ;;
+  *)
+    echo "Unexpected clientType: \"$clientType\""
+    exit 1
+    ;;
+esac
+
 case $clientToRun in
 solana-bench-tps)
   net/scripts/rsync-retry.sh -vPrc \
     "$entrypointIp":~/solana/config/bench-tps"$clientIndex".yml ./client-accounts.yml
+
+  net/scripts/rsync-retry.sh -vPrc \
+    "$entrypointIp":~/solana/config/validator-identity-1.json ./validator-identity.json
+
+  args=()
+
+  if ${RPC_CLIENT}; then
+    args+=(--use-rpc-client)
+  fi
+
+  if [[ -z "$maybeUseUnstakedConnection" ]]; then
+    args+=(--bind-address "$entrypointIp")
+    args+=(--client-node-id ./validator-identity.json)
+  fi
+
   clientCommand="\
     solana-bench-tps \
-      --entrypoint $entrypointIp:8001 \
-      --faucet $entrypointIp:9900 \
       --duration 7500 \
       --sustained \
       --threads $threadCount \
       $benchTpsExtraArgs \
       --read-client-keys ./client-accounts.yml \
+      --url "http://$entrypointIp:8899" \
+      ${args[*]} \
   "
   ;;
 idle)

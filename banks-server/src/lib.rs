@@ -1,3 +1,2 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 pub mod banks_server;
-pub mod rpc_banks_service;

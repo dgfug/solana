@@ -1,11 +1,15 @@
+#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
 pub mod cuda_runtime;
 pub mod data_budget;
+pub mod deduper;
+pub mod discard;
 pub mod packet;
 pub mod perf_libs;
 pub mod recycler;
 pub mod recycler_cache;
 pub mod sigverify;
 pub mod test_tx;
+pub mod thread;
 
 #[macro_use]
 extern crate lazy_static;
@@ -15,17 +19,20 @@ extern crate log;
 
 #[cfg(test)]
 #[macro_use]
-extern crate matches;
+extern crate assert_matches;
 
 #[macro_use]
 extern crate solana_metrics;
+
+#[macro_use]
+extern crate solana_frozen_abi_macro;
 
 fn is_rosetta_emulated() -> bool {
     #[cfg(target_os = "macos")]
     {
         use std::str::FromStr;
         std::process::Command::new("sysctl")
-            .args(&["-in", "sysctl.proc_translated"])
+            .args(["-in", "sysctl.proc_translated"])
             .output()
             .map_err(|_| ())
             .and_then(|output| String::from_utf8(output.stdout).map_err(|_| ()))
@@ -53,7 +60,10 @@ pub fn report_target_features() {
     // when run on machines without AVX causing a non-obvious process abort.  Instead detect
     // the mismatch and error cleanly.
     if !is_rosetta_emulated() {
-        #[cfg(build_target_feature_avx)]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            build_target_feature_avx
+        ))]
         {
             if is_x86_feature_detected!("avx") {
                 info!("AVX detected");
@@ -65,7 +75,10 @@ pub fn report_target_features() {
             }
         }
 
-        #[cfg(build_target_feature_avx2)]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            build_target_feature_avx2
+        ))]
         {
             if is_x86_feature_detected!("avx2") {
                 info!("AVX2 detected");

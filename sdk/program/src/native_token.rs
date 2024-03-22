@@ -1,4 +1,7 @@
-#![allow(clippy::integer_arithmetic)]
+//! Definitions for the native SOL token and its fractional lamports.
+
+#![allow(clippy::arithmetic_side_effects)]
+
 /// There are 10^9 lamports in one SOL
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 

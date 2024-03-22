@@ -1,13 +1,17 @@
-use solana_sdk::{
-    bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-    signature::{Keypair, Signer},
-    transaction::Transaction,
+use {
+    solana_program_test::ProgramTest,
+    solana_sdk::{
+        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
+        message::{v0::Message, VersionedMessage},
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        system_instruction,
+        transaction::{Transaction, VersionedTransaction},
+    },
 };
 
-use solana_program_test::ProgramTest;
-
 #[tokio::test]
-async fn test_bpf_loader_upgradable_present() {
+async fn test_bpf_loader_upgradeable_present() {
     // Arrange
     let (mut banks_client, payer, recent_blockhash) = ProgramTest::default().start().await;
 
@@ -15,7 +19,7 @@ async fn test_bpf_loader_upgradable_present() {
     let upgrade_authority_keypair = Keypair::new();
 
     let rent = banks_client.get_rent().await.unwrap();
-    let buffer_rent = rent.minimum_balance(UpgradeableLoaderState::programdata_len(1).unwrap());
+    let buffer_rent = rent.minimum_balance(UpgradeableLoaderState::size_of_programdata(1));
 
     let create_buffer_instructions = bpf_loader_upgradeable::create_buffer(
         &payer.pubkey(),
@@ -41,4 +45,40 @@ async fn test_bpf_loader_upgradable_present() {
         .unwrap();
 
     assert_eq!(buffer_account.owner, bpf_loader_upgradeable::id());
+}
+
+#[tokio::test]
+async fn versioned_transaction() {
+    let program_test = ProgramTest::default();
+    let mut context = program_test.start_with_context().await;
+
+    let program_id = Pubkey::new_unique();
+    let account = Keypair::new();
+    let rent = context.banks_client.get_rent().await.unwrap();
+    let space = 82;
+    let transaction = VersionedTransaction::try_new(
+        VersionedMessage::V0(
+            Message::try_compile(
+                &context.payer.pubkey(),
+                &[system_instruction::create_account(
+                    &context.payer.pubkey(),
+                    &account.pubkey(),
+                    rent.minimum_balance(space),
+                    space as u64,
+                    &program_id,
+                )],
+                &[],
+                context.last_blockhash,
+            )
+            .unwrap(),
+        ),
+        &[&context.payer, &account],
+    )
+    .unwrap();
+
+    context
+        .banks_client
+        .process_transaction(transaction)
+        .await
+        .unwrap();
 }

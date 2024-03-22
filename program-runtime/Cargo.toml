@@ -1,26 +1,41 @@
 [package]
 name = "solana-program-runtime"
-version = "1.9.0"
 description = "Solana program runtime"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-program-runtime"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-libc = "0.2.101"
-libloading = "0.7.0"
-log = "0.4.14"
-num-derive = { version = "0.3" }
-num-traits = { version = "0.2" }
-serde = { version = "1.0.129", features = ["derive", "rc"] }
-solana-frozen-abi = { path = "../frozen-abi", version = "=1.9.0" }
-solana-frozen-abi-macro = { path = "../frozen-abi/macro", version = "=1.9.0" }
-solana-logger = { path = "../logger", version = "=1.9.0" }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-thiserror = "1.0"
+base64 = { workspace = true }
+bincode = { workspace = true }
+eager = { workspace = true }
+enum-iterator = { workspace = true }
+itertools = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
+percentage = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+solana-frozen-abi = { workspace = true }
+solana-frozen-abi-macro = { workspace = true }
+solana-measure = { workspace = true }
+solana-metrics = { workspace = true }
+solana-sdk = { workspace = true }
+solana_rbpf = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+libsecp256k1 = { workspace = true }
+solana-logger = { workspace = true }
+solana-sdk = { workspace = true, features = ["dev-context-only-utils"] }
+test-case = { workspace = true }
 
 [lib]
 crate-type = ["lib"]
@@ -30,4 +45,4 @@ name = "solana_program_runtime"
 targets = ["x86_64-unknown-linux-gnu"]
 
 [build-dependencies]
-rustc_version = "0.4"
+rustc_version = { workspace = true }

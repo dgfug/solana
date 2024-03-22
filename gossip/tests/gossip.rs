@@ -1,4 +1,4 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 #[macro_use]
 extern crate log;
 
@@ -6,6 +6,7 @@ use {
     rayon::iter::*,
     solana_gossip::{
         cluster_info::{ClusterInfo, Node},
+        contact_info::{LegacyContactInfo as ContactInfo, Protocol},
         crds::Cursor,
         gossip_service::GossipService,
     },
@@ -18,7 +19,10 @@ use {
         timing::timestamp,
         transaction::Transaction,
     },
-    solana_streamer::socket::SocketAddrSpace,
+    solana_streamer::{
+        sendmmsg::{multi_target_send, SendPktsError},
+        socket::SocketAddrSpace,
+    },
     solana_vote_program::{vote_instruction, vote_state::Vote},
     std::{
         net::UdpSocket,
@@ -31,7 +35,7 @@ use {
     },
 };
 
-fn test_node(exit: &Arc<AtomicBool>) -> (Arc<ClusterInfo>, GossipService, UdpSocket) {
+fn test_node(exit: Arc<AtomicBool>) -> (Arc<ClusterInfo>, GossipService, UdpSocket) {
     let keypair = Arc::new(Keypair::new());
     let mut test_node = Node::new_localhost_with_pubkey(&keypair.pubkey());
     let cluster_info = Arc::new(ClusterInfo::new(
@@ -45,6 +49,7 @@ fn test_node(exit: &Arc<AtomicBool>) -> (Arc<ClusterInfo>, GossipService, UdpSoc
         test_node.sockets.gossip,
         None,
         true, // should_check_duplicate_instance
+        None,
         exit,
     );
     let _ = cluster_info.my_contact_info();
@@ -57,7 +62,7 @@ fn test_node(exit: &Arc<AtomicBool>) -> (Arc<ClusterInfo>, GossipService, UdpSoc
 
 fn test_node_with_bank(
     node_keypair: Arc<Keypair>,
-    exit: &Arc<AtomicBool>,
+    exit: Arc<AtomicBool>,
     bank_forks: Arc<RwLock<BankForks>>,
 ) -> (Arc<ClusterInfo>, GossipService, UdpSocket) {
     let mut test_node = Node::new_localhost_with_pubkey(&node_keypair.pubkey());
@@ -72,6 +77,7 @@ fn test_node_with_bank(
         test_node.sockets.gossip,
         None,
         true, // should_check_duplicate_instance
+        None,
         exit,
     );
     let _ = cluster_info.my_contact_info();
@@ -91,11 +97,10 @@ where
     F: Fn(&Vec<(Arc<ClusterInfo>, GossipService, UdpSocket)>),
 {
     let exit = Arc::new(AtomicBool::new(false));
-    let listen: Vec<_> = (0..num).map(|_| test_node(&exit)).collect();
+    let listen: Vec<_> = (0..num).map(|_| test_node(exit.clone())).collect();
     topo(&listen);
-    let mut done = true;
+    let mut done = false;
     for i in 0..(num * 32) {
-        done = true;
         let total: usize = listen.iter().map(|v| v.0.gossip_peers().len()).sum();
         if (total + num) * 10 > num * num * 9 {
             done = true;
@@ -103,7 +108,7 @@ where
         } else {
             trace!("not converged {} {} {}", i, total + num, num * num);
         }
-        sleep(Duration::new(1, 0));
+        sleep(Duration::from_secs(1));
     }
     exit.store(true, Ordering::Relaxed);
     for (_, dr, _) in listen {
@@ -111,6 +116,42 @@ where
     }
     assert!(done);
 }
+
+/// retransmit messages to a list of nodes
+fn retransmit_to(
+    peers: &[&ContactInfo],
+    data: &[u8],
+    socket: &UdpSocket,
+    forwarded: bool,
+    socket_addr_space: &SocketAddrSpace,
+) {
+    trace!("retransmit orders {}", peers.len());
+    let dests: Vec<_> = if forwarded {
+        peers
+            .iter()
+            .filter_map(|peer| peer.tvu(Protocol::UDP).ok())
+            .filter(|addr| socket_addr_space.check(addr))
+            .collect()
+    } else {
+        peers
+            .iter()
+            .filter_map(|peer| peer.tvu(Protocol::UDP).ok())
+            .filter(|addr| socket_addr_space.check(addr))
+            .collect()
+    };
+    match multi_target_send(socket, data, &dests) {
+        Ok(()) => (),
+        Err(SendPktsError::IoError(ioerr, num_failed)) => {
+            error!(
+                "retransmit_to multi_target_send error: {:?}, {}/{} packets failed",
+                ioerr,
+                num_failed,
+                dests.len(),
+            );
+        }
+    }
+}
+
 /// ring a -> b -> c -> d -> e -> a
 #[test]
 fn gossip_ring() {
@@ -122,8 +163,8 @@ fn gossip_ring() {
             let x = (n + 1) % listen.len();
             let yv = &listen[y].0;
             let mut d = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
-            d.wallclock = timestamp();
-            listen[x].0.insert_info(d);
+            d.set_wallclock(timestamp());
+            listen[x].0.insert_legacy_info(d);
         }
     });
 }
@@ -140,8 +181,8 @@ fn gossip_ring_large() {
             let x = (n + 1) % listen.len();
             let yv = &listen[y].0;
             let mut d = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
-            d.wallclock = timestamp();
-            listen[x].0.insert_info(d);
+            d.set_wallclock(timestamp());
+            listen[x].0.insert_legacy_info(d);
         }
     });
 }
@@ -156,9 +197,9 @@ fn gossip_star() {
             let y = (n + 1) % listen.len();
             let yv = &listen[y].0;
             let mut yd = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
-            yd.wallclock = timestamp();
+            yd.set_wallclock(timestamp());
             let xv = &listen[x].0;
-            xv.insert_info(yd);
+            xv.insert_legacy_info(yd);
             trace!("star leader {}", &xv.id());
         }
     });
@@ -174,12 +215,12 @@ fn gossip_rstar() {
             let xv = &listen[0].0;
             xv.lookup_contact_info(&xv.id(), |ci| ci.clone()).unwrap()
         };
-        trace!("rstar leader {}", xd.id);
+        trace!("rstar leader {}", xd.pubkey());
         for n in 0..(num - 1) {
             let y = (n + 1) % listen.len();
             let yv = &listen[y].0;
-            yv.insert_info(xd.clone());
-            trace!("rstar insert {} into {}", xd.id, yv.id());
+            yv.insert_legacy_info(xd.clone());
+            trace!("rstar insert {} into {}", xd.pubkey(), yv.id());
         }
     });
 }
@@ -189,11 +230,11 @@ pub fn cluster_info_retransmit() {
     solana_logger::setup();
     let exit = Arc::new(AtomicBool::new(false));
     trace!("c1:");
-    let (c1, dr1, tn1) = test_node(&exit);
+    let (c1, dr1, tn1) = test_node(exit.clone());
     trace!("c2:");
-    let (c2, dr2, tn2) = test_node(&exit);
+    let (c2, dr2, tn2) = test_node(exit.clone());
     trace!("c3:");
-    let (c3, dr3, tn3) = test_node(&exit);
+    let (c3, dr3, tn3) = test_node(exit.clone());
     let c1_contact_info = c1.my_contact_info();
 
     c2.insert_info(c1_contact_info.clone());
@@ -211,16 +252,16 @@ pub fn cluster_info_retransmit() {
         if done {
             break;
         }
-        sleep(Duration::new(1, 0));
+        sleep(Duration::from_secs(1));
     }
     assert!(done);
     let mut p = Packet::default();
-    p.meta.size = 10;
+    p.meta_mut().size = 10;
     let peers = c1.tvu_peers();
     let retransmit_peers: Vec<_> = peers.iter().collect();
-    ClusterInfo::retransmit_to(
+    retransmit_to(
         &retransmit_peers,
-        &p.data[..p.meta.size],
+        p.data(..).unwrap(),
         &tn1,
         false,
         &SocketAddrSpace::Unspecified,
@@ -229,8 +270,8 @@ pub fn cluster_info_retransmit() {
         .into_par_iter()
         .map(|s| {
             let mut p = Packet::default();
-            s.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
-            let res = s.recv_from(&mut p.data);
+            s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let res = s.recv_from(p.buffer_mut());
             res.is_err() //true if failed to receive the retransmit packet
         })
         .collect();
@@ -246,11 +287,13 @@ pub fn cluster_info_retransmit() {
 #[test]
 #[ignore]
 pub fn cluster_info_scale() {
-    use solana_measure::measure::Measure;
-    use solana_perf::test_tx::test_tx;
-    use solana_runtime::bank::Bank;
-    use solana_runtime::genesis_utils::{
-        create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs,
+    use {
+        solana_measure::measure::Measure,
+        solana_perf::test_tx::test_tx,
+        solana_runtime::{
+            bank::Bank,
+            genesis_utils::{create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
+        },
     };
     solana_logger::setup();
     let exit = Arc::new(AtomicBool::new(false));
@@ -268,12 +311,16 @@ pub fn cluster_info_scale() {
         vec![100; vote_keypairs.len()],
     );
     let bank0 = Bank::new_for_tests(&genesis_config_info.genesis_config);
-    let bank_forks = Arc::new(RwLock::new(BankForks::new(bank0)));
+    let bank_forks = BankForks::new_rw_arc(bank0);
 
     let nodes: Vec<_> = vote_keypairs
         .into_iter()
         .map(|keypairs| {
-            test_node_with_bank(Arc::new(keypairs.node_keypair), &exit, bank_forks.clone())
+            test_node_with_bank(
+                Arc::new(keypairs.node_keypair),
+                exit.clone(),
+                bank_forks.clone(),
+            )
         })
         .collect();
     let ci0 = nodes[0].0.my_contact_info();
@@ -332,7 +379,6 @@ pub fn cluster_info_scale() {
                 //if node.0.get_votes(0).1.len() != (num_nodes * num_votes) {
                 let has_tx = node
                     .get_votes(&mut Cursor::default())
-                    .1
                     .iter()
                     .filter(|v| v.message.account_keys == tx.message.account_keys)
                     .count();

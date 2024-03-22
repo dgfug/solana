@@ -18,24 +18,22 @@ use crate::{
 
 crate::declare_id!("Feature111111111111111111111111111111111111");
 
-#[derive(Default, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Feature {
     pub activated_at: Option<Slot>,
 }
 
 impl Feature {
-    pub fn size_of() -> usize {
-        bincode::serialized_size(&Feature {
-            activated_at: Some(0),
-        })
-        .unwrap() as usize
+    pub const fn size_of() -> usize {
+        9 // see test_feature_size_of.
     }
 
     pub fn from_account_info(account_info: &AccountInfo) -> Result<Self, ProgramError> {
         if *account_info.owner != id() {
-            return Err(ProgramError::InvalidArgument);
+            return Err(ProgramError::InvalidAccountOwner);
         }
-        bincode::deserialize(&account_info.data.borrow()).map_err(|_| ProgramError::InvalidArgument)
+        bincode::deserialize(&account_info.data.borrow())
+            .map_err(|_| ProgramError::InvalidAccountData)
     }
 }
 
@@ -62,11 +60,16 @@ pub fn activate_with_lamports(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use solana_program::clock::Slot;
+    use {super::*, solana_program::clock::Slot};
 
     #[test]
-    fn feature_sizeof() {
+    fn test_feature_size_of() {
+        assert_eq!(Feature::size_of() as u64, {
+            let feature = Feature {
+                activated_at: Some(0),
+            };
+            bincode::serialized_size(&feature).unwrap()
+        });
         assert!(
             Feature::size_of() >= bincode::serialized_size(&Feature::default()).unwrap() as usize
         );

@@ -28,7 +28,7 @@ impl Presigner {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum PresignerError {
     #[error("pre-generated signature cannot verify data")]
     VerificationFailure,
@@ -63,8 +63,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::signer::keypair::keypair_from_seed;
+    use {super::*, crate::signer::keypair::keypair_from_seed};
 
     #[test]
     fn test_presigner() {

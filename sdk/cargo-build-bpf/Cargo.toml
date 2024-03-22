@@ -1,25 +1,17 @@
 [package]
 name = "solana-cargo-build-bpf"
-version = "1.9.0"
-description = "Compile a local package and all of its dependencies using the Solana BPF SDK"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-homepage = "https://solana.com/"
-license = "Apache-2.0"
-edition = "2018"
+description = "Compile a local package and all of its dependencies using the Solana SBF SDK"
 publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-bzip2 = "0.4.3"
-clap = "2.33.3"
-regex = "1.5.4"
-cargo_metadata = "0.14.0"
-solana-sdk = { path = "..", version = "=1.9.0" }
-solana-download-utils = { path = "../../download-utils", version = "=1.9.0" }
-tar = "0.4.37"
-
-[dev-dependencies]
-serial_test = "*"
+log = { workspace = true, features = ["std"] }
+solana-logger = { workspace = true }
 
 [features]
 program = []

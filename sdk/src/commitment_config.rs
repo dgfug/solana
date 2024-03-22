@@ -1,8 +1,9 @@
+//! Definitions of commitment levels.
+
 #![allow(deprecated)]
 #![cfg(feature = "full")]
 
-use std::str::FromStr;
-use thiserror::Error;
+use {std::str::FromStr, thiserror::Error};
 
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -61,19 +62,19 @@ impl CommitmentConfig {
         }
     }
 
-    pub fn finalized() -> Self {
+    pub const fn finalized() -> Self {
         Self {
             commitment: CommitmentLevel::Finalized,
         }
     }
 
-    pub fn confirmed() -> Self {
+    pub const fn confirmed() -> Self {
         Self {
             commitment: CommitmentLevel::Confirmed,
         }
     }
 
-    pub fn processed() -> Self {
+    pub const fn processed() -> Self {
         Self {
             commitment: CommitmentLevel::Processed,
         }
@@ -231,7 +232,7 @@ impl std::fmt::Display for CommitmentLevel {
             CommitmentLevel::Confirmed => "confirmed",
             CommitmentLevel::Finalized => "finalized",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 

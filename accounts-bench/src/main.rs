@@ -1,17 +1,27 @@
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
+
 #[macro_use]
 extern crate log;
-use clap::{crate_description, crate_name, value_t, App, Arg};
-use rayon::prelude::*;
-use solana_measure::measure::Measure;
-use solana_runtime::{
-    accounts::{create_test_accounts, update_accounts_bench, Accounts},
-    accounts_db::AccountShrinkThreshold,
-    accounts_index::AccountSecondaryIndexes,
-    ancestors::Ancestors,
+use {
+    clap::{crate_description, crate_name, value_t, App, Arg},
+    rayon::prelude::*,
+    solana_accounts_db::{
+        accounts::Accounts,
+        accounts_db::{
+            test_utils::{create_test_accounts, update_accounts_bench},
+            AccountShrinkThreshold, AccountsDb, CalcAccountsHashDataSource,
+            ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS,
+        },
+        accounts_index::AccountSecondaryIndexes,
+        ancestors::Ancestors,
+    },
+    solana_measure::measure::Measure,
+    solana_sdk::{
+        genesis_config::ClusterType, pubkey::Pubkey, rent_collector::RentCollector,
+        sysvar::epoch_schedule::EpochSchedule,
+    },
+    std::{env, fs, path::PathBuf, sync::Arc},
 };
-use solana_sdk::{genesis_config::ClusterType, pubkey::Pubkey};
-use std::{env, fs, path::PathBuf};
 
 fn main() {
     solana_logger::setup();
@@ -52,22 +62,25 @@ fn main() {
     let num_accounts = value_t!(matches, "num_accounts", usize).unwrap_or(10_000);
     let iterations = value_t!(matches, "iterations", usize).unwrap_or(20);
     let clean = matches.is_present("clean");
-    println!("clean: {:?}", clean);
+    println!("clean: {clean:?}");
 
     let path = PathBuf::from(env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_owned()))
         .join("accounts-bench");
-    println!("cleaning file system: {:?}", path);
+    println!("cleaning file system: {path:?}");
     if fs::remove_dir_all(path.clone()).is_err() {
-        println!("Warning: Couldn't remove {:?}", path);
+        println!("Warning: Couldn't remove {path:?}");
     }
-    let accounts = Accounts::new_with_config_for_benches(
+    let accounts_db = AccountsDb::new_with_config(
         vec![path],
         &ClusterType::Testnet,
         AccountSecondaryIndexes::default(),
-        false,
         AccountShrinkThreshold::default(),
+        Some(ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS),
+        None,
+        Arc::default(),
     );
-    println!("Creating {} accounts", num_accounts);
+    let accounts = Accounts::new(Arc::new(accounts_db));
+    println!("Creating {num_accounts} accounts");
     let mut create_time = Measure::start("create accounts");
     let pubkeys: Vec<_> = (0..num_slots)
         .into_par_iter()
@@ -102,9 +115,9 @@ fn main() {
     for x in 0..iterations {
         if clean {
             let mut time = Measure::start("clean");
-            accounts.accounts_db.clean_accounts(None, false, None);
+            accounts.accounts_db.clean_accounts_for_tests();
             time.stop();
-            println!("{}", time);
+            println!("{time}");
             for slot in 0..num_slots {
                 update_accounts_bench(&accounts, &pubkeys, ((x + 1) * num_slots + slot) as u64);
                 accounts.add_root((x * num_slots + slot) as u64);
@@ -112,17 +125,20 @@ fn main() {
         } else {
             let mut pubkeys: Vec<Pubkey> = vec![];
             let mut time = Measure::start("hash");
-            let results = accounts.accounts_db.update_accounts_hash(0, &ancestors);
+            let results = accounts
+                .accounts_db
+                .update_accounts_hash_for_tests(0, &ancestors, false, false);
             time.stop();
             let mut time_store = Measure::start("hash using store");
-            let results_store = accounts.accounts_db.update_accounts_hash_with_index_option(
-                false,
+            let results_store = accounts.accounts_db.update_accounts_hash_with_verify(
+                CalcAccountsHashDataSource::Storages,
                 false,
                 solana_sdk::clock::Slot::default(),
                 &ancestors,
                 None,
-                false,
-                None,
+                &EpochSchedule::default(),
+                &RentCollector::default(),
+                true,
             );
             time_store.stop();
             if results != results_store {
@@ -130,7 +146,7 @@ fn main() {
             }
             println!(
                 "hash,{},{},{},{}%",
-                results.0,
+                results.0 .0,
                 time,
                 time_store,
                 (time_store.as_us() as f64 / time.as_us() as f64 * 100.0f64) as u32
@@ -145,6 +161,6 @@ fn main() {
         info!("update_accounts_hash(us),{}", x);
     }
     for x in elapsed_store {
-        info!("calculate_accounts_hash_without_index(us),{}", x);
+        info!("calculate_accounts_hash_from_storages(us),{}", x);
     }
 }

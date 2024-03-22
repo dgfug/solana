@@ -7,8 +7,7 @@ use {
         pubkey::{Pubkey, MAX_SEED_LEN},
         signature::{read_keypair_file, Signature},
     },
-    std::fmt::Display,
-    std::str::FromStr,
+    std::{fmt::Display, ops::RangeBounds, str::FromStr},
 };
 
 fn is_parsable_generic<U, T>(string: T) -> Result<(), String>
@@ -21,7 +20,7 @@ where
         .as_ref()
         .parse::<U>()
         .map(|_| ())
-        .map_err(|err| format!("error parsing '{}': {}", string, err))
+        .map_err(|err| format!("error parsing '{string}': {err}"))
 }
 
 // Return an error if string cannot be parsed as type T.
@@ -36,24 +35,21 @@ where
 
 // Return an error if string cannot be parsed as numeric type T, and value not within specified
 // range
-pub fn is_within_range<T>(string: String, range_min: T, range_max: T) -> Result<(), String>
+pub fn is_within_range<T, R>(string: String, range: R) -> Result<(), String>
 where
     T: FromStr + Copy + std::fmt::Debug + PartialOrd + std::ops::Add<Output = T> + From<usize>,
     T::Err: Display,
+    R: RangeBounds<T> + std::fmt::Debug,
 {
     match string.parse::<T>() {
         Ok(input) => {
-            let range = range_min..range_max + 1.into();
             if !range.contains(&input) {
-                Err(format!(
-                    "input '{:?}' out of range ({:?}..{:?}]",
-                    input, range_min, range_max
-                ))
+                Err(format!("input '{input:?}' out of range {range:?}"))
             } else {
                 Ok(())
             }
         }
-        Err(err) => Err(format!("error parsing '{}': {}", string, err)),
+        Err(err) => Err(format!("error parsing '{string}': {err}")),
     }
 }
 
@@ -80,7 +76,7 @@ where
 {
     read_keypair_file(string.as_ref())
         .map(|_| ())
-        .map_err(|err| format!("{}", err))
+        .map_err(|err| format!("{err}"))
 }
 
 // Return an error if a keypair file cannot be parsed
@@ -93,7 +89,7 @@ where
     }
     read_keypair_file(string.as_ref())
         .map(|_| ())
-        .map_err(|err| format!("{}", err))
+        .map_err(|err| format!("{err}"))
 }
 
 // Return an error if a `SignerSourceKind::Prompt` cannot be parsed
@@ -105,13 +101,12 @@ where
         return Ok(());
     }
     match parse_signer_source(string.as_ref())
-        .map_err(|err| format!("{}", err))?
+        .map_err(|err| format!("{err}"))?
         .kind
     {
         SignerSourceKind::Prompt => Ok(()),
         _ => Err(format!(
-            "Unable to parse input as `prompt:` URI scheme or `ASK` keyword: {}",
-            string
+            "Unable to parse input as `prompt:` URI scheme or `ASK` keyword: {string}"
         )),
     }
 }
@@ -131,7 +126,7 @@ where
     T: AsRef<str> + Display,
 {
     match parse_signer_source(string.as_ref())
-        .map_err(|err| format!("{}", err))?
+        .map_err(|err| format!("{err}"))?
         .kind
     {
         SignerSourceKind::Filepath(path) => is_keypair(path),
@@ -172,10 +167,10 @@ where
                     .ok_or_else(|| "Malformed signer string".to_string())?,
             ) {
                 Ok(_) => Ok(()),
-                Err(err) => Err(format!("{}", err)),
+                Err(err) => Err(format!("{err}")),
             }
         }
-        Err(err) => Err(format!("{}", err)),
+        Err(err) => Err(format!("{err}")),
     }
 }
 
@@ -192,7 +187,7 @@ where
                 Err("no host provided".to_string())
             }
         }
-        Err(err) => Err(format!("{}", err)),
+        Err(err) => Err(format!("{err}")),
     }
 }
 
@@ -208,7 +203,7 @@ where
                 Err("no host provided".to_string())
             }
         }
-        Err(err) => Err(format!("{}", err)),
+        Err(err) => Err(format!("{err}")),
     }
 }
 
@@ -237,16 +232,16 @@ where
     is_parsable_generic::<Slot, _>(slot)
 }
 
-pub fn is_bin<T>(bins: T) -> Result<(), String>
+pub fn is_pow2<T>(bins: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
     bins.as_ref()
         .parse::<usize>()
-        .map_err(|e| format!("Unable to parse bins, provided: {}, err: {}", bins, e))
+        .map_err(|e| format!("Unable to parse, provided: {bins}, err: {e}"))
         .and_then(|v| {
             if !v.is_power_of_two() {
-                Err(format!("Bins must be a power of 2: {}", v))
+                Err(format!("Must be a power of 2: {v}"))
             } else {
                 Ok(())
             }
@@ -267,17 +262,11 @@ where
     percentage
         .as_ref()
         .parse::<u8>()
-        .map_err(|e| {
-            format!(
-                "Unable to parse input percentage, provided: {}, err: {}",
-                percentage, e
-            )
-        })
+        .map_err(|e| format!("Unable to parse input percentage, provided: {percentage}, err: {e}"))
         .and_then(|v| {
             if v > 100 {
                 Err(format!(
-                    "Percentage must be in range of 0 to 100, provided: {}",
-                    v
+                    "Percentage must be in range of 0 to 100, provided: {v}"
                 ))
             } else {
                 Ok(())
@@ -293,8 +282,7 @@ where
         Ok(())
     } else {
         Err(format!(
-            "Unable to parse input amount as integer or float, provided: {}",
-            amount
+            "Unable to parse input amount as integer or float, provided: {amount}"
         ))
     }
 }
@@ -310,8 +298,7 @@ where
         Ok(())
     } else {
         Err(format!(
-            "Unable to parse input amount as integer or float, provided: {}",
-            amount
+            "Unable to parse input amount as integer or float, provided: {amount}"
         ))
     }
 }
@@ -322,37 +309,74 @@ where
 {
     DateTime::parse_from_rfc3339(value.as_ref())
         .map(|_| ())
-        .map_err(|e| format!("{}", e))
+        .map_err(|e| format!("{e}"))
 }
 
 pub fn is_derivation<T>(value: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
-    let value = value.as_ref().replace("'", "");
+    let value = value.as_ref().replace('\'', "");
     let mut parts = value.split('/');
     let account = parts.next().unwrap();
     account
         .parse::<u32>()
-        .map_err(|e| {
-            format!(
-                "Unable to parse derivation, provided: {}, err: {}",
-                account, e
-            )
-        })
+        .map_err(|e| format!("Unable to parse derivation, provided: {account}, err: {e}"))
         .and_then(|_| {
             if let Some(change) = parts.next() {
                 change.parse::<u32>().map_err(|e| {
-                    format!(
-                        "Unable to parse derivation, provided: {}, err: {}",
-                        change, e
-                    )
+                    format!("Unable to parse derivation, provided: {change}, err: {e}")
                 })
             } else {
                 Ok(0)
             }
         })
         .map(|_| ())
+}
+
+pub fn is_structured_seed<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let (prefix, value) = value
+        .as_ref()
+        .split_once(':')
+        .ok_or("Seed must contain ':' as delimiter")
+        .unwrap();
+    if prefix.is_empty() || value.is_empty() {
+        Err(String::from("Seed prefix or value is empty"))
+    } else {
+        match prefix {
+            "string" | "pubkey" | "hex" | "u8" => Ok(()),
+            _ => {
+                let len = prefix.len();
+                if len != 5 && len != 6 {
+                    Err(format!("Wrong prefix length {len} {prefix}:{value}"))
+                } else {
+                    let sign = &prefix[0..1];
+                    let type_size = &prefix[1..len.saturating_sub(2)];
+                    let byte_order = &prefix[len.saturating_sub(2)..len];
+                    if sign != "u" && sign != "i" {
+                        Err(format!("Wrong prefix sign {sign} {prefix}:{value}"))
+                    } else if type_size != "16"
+                        && type_size != "32"
+                        && type_size != "64"
+                        && type_size != "128"
+                    {
+                        Err(format!(
+                            "Wrong prefix type size {type_size} {prefix}:{value}"
+                        ))
+                    } else if byte_order != "le" && byte_order != "be" {
+                        Err(format!(
+                            "Wrong prefix byte order {byte_order} {prefix}:{value}"
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub fn is_derived_address_seed<T>(value: T) -> Result<(), String>
@@ -362,8 +386,35 @@ where
     let value = value.as_ref();
     if value.len() > MAX_SEED_LEN {
         Err(format!(
-            "Address seed must not be longer than {} bytes",
-            MAX_SEED_LEN
+            "Address seed must not be longer than {MAX_SEED_LEN} bytes"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_maximum_full_snapshot_archives_to_retain<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let value = value.as_ref();
+    if value.eq("0") {
+        Err(String::from(
+            "--maximum-full-snapshot-archives-to-retain cannot be zero",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_maximum_incremental_snapshot_archives_to_retain<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let value = value.as_ref();
+    if value.eq("0") {
+        Err(String::from(
+            "--maximum-incremental-snapshot-archives-to-retain cannot be zero",
         ))
     } else {
         Ok(())

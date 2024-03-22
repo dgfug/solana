@@ -1,19 +1,21 @@
-#![allow(clippy::integer_arithmetic)]
-use crate::rpc_client::RpcClient;
-use log::*;
-use solana_measure::measure::Measure;
-use solana_sdk::{
-    commitment_config::CommitmentConfig, signature::Signature, timing::timestamp,
-    transaction::Transaction,
-};
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock,
+#![allow(clippy::arithmetic_side_effects)]
+use {
+    log::*,
+    solana_measure::measure::Measure,
+    solana_rpc_client::rpc_client::RpcClient,
+    solana_sdk::{
+        commitment_config::CommitmentConfig, signature::Signature, timing::timestamp,
+        transaction::Transaction,
     },
-    thread::{sleep, Builder, JoinHandle},
-    time::{Duration, Instant},
+    std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, RwLock,
+        },
+        thread::{sleep, Builder, JoinHandle},
+        time::{Duration, Instant},
+    },
 };
 
 // signature, timestamp, id
@@ -25,17 +27,31 @@ pub struct TransactionExecutor {
     cleared: Arc<RwLock<Vec<u64>>>,
     exit: Arc<AtomicBool>,
     counter: AtomicU64,
-    client: RpcClient,
+    client: Arc<RpcClient>,
 }
 
 impl TransactionExecutor {
     pub fn new(entrypoint_addr: SocketAddr) -> Self {
+        let client = Arc::new(RpcClient::new_socket_with_commitment(
+            entrypoint_addr,
+            CommitmentConfig::confirmed(),
+        ));
+        Self::new_with_rpc_client(client)
+    }
+
+    pub fn new_with_url<U: ToString>(url: U) -> Self {
+        let client = Arc::new(RpcClient::new_with_commitment(
+            url,
+            CommitmentConfig::confirmed(),
+        ));
+        Self::new_with_rpc_client(client)
+    }
+
+    pub fn new_with_rpc_client(client: Arc<RpcClient>) -> Self {
         let sigs = Arc::new(RwLock::new(Vec::new()));
         let cleared = Arc::new(RwLock::new(Vec::new()));
         let exit = Arc::new(AtomicBool::new(false));
-        let sig_clear_t = Self::start_sig_clear_thread(&exit, &sigs, &cleared, entrypoint_addr);
-        let client =
-            RpcClient::new_socket_with_commitment(entrypoint_addr, CommitmentConfig::confirmed());
+        let sig_clear_t = Self::start_sig_clear_thread(exit.clone(), &sigs, &cleared, &client);
         Self {
             sigs,
             cleared,
@@ -80,21 +96,17 @@ impl TransactionExecutor {
     }
 
     fn start_sig_clear_thread(
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
         sigs: &Arc<RwLock<PendingQueue>>,
         cleared: &Arc<RwLock<Vec<u64>>>,
-        entrypoint_addr: SocketAddr,
+        client: &Arc<RpcClient>,
     ) -> JoinHandle<()> {
         let sigs = sigs.clone();
-        let exit = exit.clone();
         let cleared = cleared.clone();
+        let client = client.clone();
         Builder::new()
-            .name("sig_clear".to_string())
+            .name("solSigClear".to_string())
             .spawn(move || {
-                let client = RpcClient::new_socket_with_commitment(
-                    entrypoint_addr,
-                    CommitmentConfig::confirmed(),
-                );
                 let mut success = 0;
                 let mut error_count = 0;
                 let mut timed_out = 0;

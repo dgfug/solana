@@ -5,6 +5,7 @@ pub struct SenderStakeArgs {
     pub stake_authority: Box<dyn Signer>,
     pub withdraw_authority: Box<dyn Signer>,
     pub lockup_authority: Option<Box<dyn Signer>>,
+    pub rent_exempt_reserve: Option<u64>,
 }
 
 pub struct StakeArgs {
@@ -42,6 +43,7 @@ pub struct TransactionLogArgs {
     pub output_path: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     DistributeTokens(DistributeTokensArgs),
     Balances(BalancesArgs),

@@ -1,25 +1,31 @@
 [package]
 name = "solana-bucket-map"
-version = "1.9.0"
 description = "solana-bucket-map"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-bucket-map"
 readme = "../README.md"
-repository = "https://github.com/solana-labs/solana"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-license = "Apache-2.0"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-rayon = "1.5.0"
-solana-logger = { path = "../logger", version = "=1.9.0" }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-memmap2 = "0.5.0"
-log = { version = "0.4.11" }
-solana-measure = { path = "../measure", version = "=1.9.0" }
-rand = "0.7.0"
-fs_extra = "1.2.0"
-tempfile = "3.2.0"
+bv = { workspace = true, features = ["serde"] }
+bytemuck = { workspace = true, features = ["derive"] }
+log = { workspace = true }
+memmap2 = { workspace = true }
+modular-bitfield = { workspace = true }
+num_enum = { workspace = true }
+rand = { workspace = true }
+solana-measure = { workspace = true }
+solana-sdk = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+fs_extra = { workspace = true }
+rayon = { workspace = true }
+solana-logger = { workspace = true }
 
 [lib]
 crate-type = ["lib"]

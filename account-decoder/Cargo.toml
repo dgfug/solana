@@ -1,30 +1,36 @@
 [package]
 name = "solana-account-decoder"
-version = "1.9.0"
 description = "Solana account decoder"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-account-decoder"
-license = "Apache-2.0"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-base64 = "0.12.3"
-bincode = "1.3.3"
-bs58 = "0.4.0"
-bv = "0.11.1"
-Inflector = "0.11.4"
-lazy_static = "1.4.0"
-serde = "1.0.130"
-serde_derive = "1.0.103"
-serde_json = "1.0.68"
-solana-config-program = { path = "../programs/config", version = "=1.9.0" }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-solana-vote-program = { path = "../programs/vote", version = "=1.9.0" }
-spl-token-v2-0 = { package = "spl-token", version = "=3.2.0", features = ["no-entrypoint"] }
-thiserror = "1.0"
-zstd = "0.9.0"
+Inflector = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+bs58 = { workspace = true }
+bv = { workspace = true }
+lazy_static = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+solana-config-program = { workspace = true }
+solana-sdk = { workspace = true }
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
+spl-token-group-interface = { workspace = true }
+spl-token-metadata-interface = { workspace = true }
+thiserror = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+spl-pod = { workspace = true }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

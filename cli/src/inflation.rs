@@ -1,19 +1,21 @@
-use crate::cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult};
-use clap::{App, Arg, ArgMatches, SubCommand};
-use solana_clap_utils::{
-    input_parsers::{pubkeys_of, value_of},
-    input_validators::is_valid_pubkey,
-    keypair::*,
+use {
+    crate::cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
+    clap::{App, Arg, ArgMatches, SubCommand},
+    solana_clap_utils::{
+        input_parsers::{pubkeys_of, value_of},
+        input_validators::is_valid_pubkey,
+        keypair::*,
+    },
+    solana_cli_output::{
+        CliEpochRewardshMetadata, CliInflation, CliKeyedEpochReward, CliKeyedEpochRewards,
+    },
+    solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    solana_rpc_client::rpc_client::RpcClient,
+    solana_sdk::{clock::Epoch, pubkey::Pubkey},
+    std::rc::Rc,
 };
-use solana_cli_output::{
-    CliEpochRewardshMetadata, CliInflation, CliKeyedEpochReward, CliKeyedEpochRewards,
-};
-use solana_client::rpc_client::RpcClient;
-use solana_remote_wallet::remote_wallet::RemoteWalletManager;
-use solana_sdk::{clock::Epoch, pubkey::Pubkey};
-use std::sync::Arc;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InflationCliCommand {
     Show,
     Rewards(Vec<Pubkey>, Option<Epoch>),
@@ -37,7 +39,7 @@ impl InflationSubCommands for App<'_, '_> {
                                 .index(1)
                                 .multiple(true)
                                 .required(true),
-                            "Address of account to query for rewards. "
+                            "Account to query for rewards."
                         ))
                         .arg(
                             Arg::with_name("rewards_epoch")
@@ -54,7 +56,7 @@ impl InflationSubCommands for App<'_, '_> {
 pub fn parse_inflation_subcommand(
     matches: &ArgMatches<'_>,
     _default_signer: &DefaultSigner,
-    _wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
+    _wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
 ) -> Result<CliCommandInfo, CliError> {
     let command = match matches.subcommand() {
         ("rewards", Some(matches)) => {
@@ -105,9 +107,9 @@ fn process_rewards(
         .get_inflation_reward(addresses, rewards_epoch)
         .map_err(|err| {
             if let Some(epoch) = rewards_epoch {
-                format!("Rewards not available for epoch {}", epoch)
+                format!("Rewards not available for epoch {epoch}")
             } else {
-                format!("Rewards not available {}", err)
+                format!("Rewards not available {err}")
             }
         })?;
     let epoch_schedule = rpc_client.get_epoch_schedule()?;

@@ -1,4 +1,5 @@
 #![cfg(feature = "full")]
+
 use crate::{
     pubkey::Pubkey,
     signature::{Signature, Signer, SignerError},
@@ -13,102 +14,44 @@ pub trait Signers {
     fn is_interactive(&self) -> bool;
 }
 
-macro_rules! default_keypairs_impl {
-    () => {
-        fn pubkeys(&self) -> Vec<Pubkey> {
-            self.iter().map(|keypair| keypair.pubkey()).collect()
-        }
+/// Any `T` where `T` impls `IntoIterator` yielding
+/// `Signer`s implements `Signers`.
+///
+/// This includes [&dyn Signer], [Box<dyn Signer>],
+/// [&dyn Signer; N], Vec<dyn Signer>, Vec<Keypair>, etc.
+///
+/// When used as a generic function param, `&T`
+/// should be used instead of `T` where T: Signers, due to the `?Sized` bounds on T.
+/// E.g. [Signer] implements `Signers`, but `&[Signer]` does not
+impl<T: ?Sized, S: Signer + ?Sized> Signers for T
+where
+    for<'a> &'a T: IntoIterator<Item = &'a S>,
+{
+    fn pubkeys(&self) -> Vec<Pubkey> {
+        self.into_iter().map(|keypair| keypair.pubkey()).collect()
+    }
 
-        fn try_pubkeys(&self) -> Result<Vec<Pubkey>, SignerError> {
-            let mut pubkeys = Vec::new();
-            for keypair in self.iter() {
-                pubkeys.push(keypair.try_pubkey()?);
-            }
-            Ok(pubkeys)
-        }
+    fn try_pubkeys(&self) -> Result<Vec<Pubkey>, SignerError> {
+        self.into_iter()
+            .map(|keypair| keypair.try_pubkey())
+            .collect()
+    }
 
-        fn sign_message(&self, message: &[u8]) -> Vec<Signature> {
-            self.iter()
-                .map(|keypair| keypair.sign_message(message))
-                .collect()
-        }
+    fn sign_message(&self, message: &[u8]) -> Vec<Signature> {
+        self.into_iter()
+            .map(|keypair| keypair.sign_message(message))
+            .collect()
+    }
 
-        fn try_sign_message(&self, message: &[u8]) -> Result<Vec<Signature>, SignerError> {
-            let mut signatures = Vec::new();
-            for keypair in self.iter() {
-                signatures.push(keypair.try_sign_message(message)?);
-            }
-            Ok(signatures)
-        }
+    fn try_sign_message(&self, message: &[u8]) -> Result<Vec<Signature>, SignerError> {
+        self.into_iter()
+            .map(|keypair| keypair.try_sign_message(message))
+            .collect()
+    }
 
-        fn is_interactive(&self) -> bool {
-            self.iter().any(|s| s.is_interactive())
-        }
-    };
-}
-
-impl<T: Signer> Signers for [&T] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [Box<dyn Signer>] {
-    default_keypairs_impl!();
-}
-
-impl Signers for Vec<Box<dyn Signer>> {
-    default_keypairs_impl!();
-}
-
-impl Signers for Vec<&dyn Signer> {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer; 0] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer; 1] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer; 2] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer; 3] {
-    default_keypairs_impl!();
-}
-
-impl Signers for [&dyn Signer; 4] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for [&T; 0] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for [&T; 1] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for [&T; 2] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for [&T; 3] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for [&T; 4] {
-    default_keypairs_impl!();
-}
-
-impl<T: Signer> Signers for Vec<&T> {
-    default_keypairs_impl!();
+    fn is_interactive(&self) -> bool {
+        self.into_iter().any(|s| s.is_interactive())
+    }
 }
 
 #[cfg(test)]
@@ -158,7 +101,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::blacklisted_name)]
     fn test_dyn_keypairs_by_ref_compile() {
         let foo = Foo {};
         let bar = Bar {};

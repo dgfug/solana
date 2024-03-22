@@ -2,8 +2,15 @@ use {
     solana_banks_client::BanksClient,
     solana_program_test::{processor, ProgramTest},
     solana_sdk::{
-        account_info::AccountInfo, entrypoint::ProgramResult, hash::Hash, instruction::Instruction,
-        msg, pubkey::Pubkey, rent::Rent, signature::Keypair, signature::Signer, system_instruction,
+        account_info::AccountInfo,
+        entrypoint::ProgramResult,
+        hash::Hash,
+        instruction::Instruction,
+        msg,
+        pubkey::Pubkey,
+        rent::Rent,
+        signature::{Keypair, Signer},
+        system_instruction,
         transaction::Transaction,
     },
 };
@@ -29,21 +36,17 @@ fn simulate_fuzz() {
         processor!(process_instruction),
     );
 
-    let (mut banks_client, payer, last_blockhash) =
-        rt.block_on(async { program_test.start().await });
+    let (mut banks_client, payer, last_blockhash) = rt.block_on(program_test.start());
 
     // the honggfuzz `fuzz!` macro does not allow for async closures,
     // so we have to use the runtime directly to run async functions
-    rt.block_on(async {
-        run_fuzz_instructions(
-            &[1, 2, 3, 4, 5],
-            &mut banks_client,
-            &payer,
-            last_blockhash,
-            &program_id,
-        )
-        .await
-    });
+    rt.block_on(run_fuzz_instructions(
+        &[1, 2, 3, 4, 5],
+        &mut banks_client,
+        &payer,
+        last_blockhash,
+        &program_id,
+    ));
 }
 
 #[test]
@@ -57,20 +60,17 @@ fn simulate_fuzz_with_context() {
         processor!(process_instruction),
     );
 
-    let mut context = rt.block_on(async { program_test.start_with_context().await });
+    let mut context = rt.block_on(program_test.start_with_context());
 
     // the honggfuzz `fuzz!` macro does not allow for async closures,
     // so we have to use the runtime directly to run async functions
-    rt.block_on(async {
-        run_fuzz_instructions(
-            &[1, 2, 3, 4, 5],
-            &mut context.banks_client,
-            &context.payer,
-            context.last_blockhash,
-            &program_id,
-        )
-        .await
-    });
+    rt.block_on(run_fuzz_instructions(
+        &[1, 2, 3, 4, 5],
+        &mut context.banks_client,
+        &context.payer,
+        context.last_blockhash,
+        &program_id,
+    ));
 }
 
 async fn run_fuzz_instructions(

@@ -1,7 +1,11 @@
-use crate::{clock::DEFAULT_TICKS_PER_SECOND, unchecked_div_by_const};
-use std::time::Duration;
+//! Definitions of Solana's proof of history.
 
-#[derive(Serialize, Deserialize, Clone, Debug, AbiExample)]
+use {
+    crate::{clock::DEFAULT_TICKS_PER_SECOND, unchecked_div_by_const},
+    std::time::Duration,
+};
+
+#[derive(Serialize, Deserialize, Clone, Debug, AbiExample, Eq, PartialEq)]
 pub struct PohConfig {
     /// The target tick rate of the cluster.
     pub target_tick_duration: Duration,
@@ -10,9 +14,8 @@ pub struct PohConfig {
     pub target_tick_count: Option<u64>,
 
     /// How many hashes to roll before emitting the next tick entry.
-    /// None enables "Low power mode", which implies:
-    /// * sleep for `target_tick_duration` instead of hashing
-    /// * the number of hashes per tick will be variable
+    /// None enables "Low power mode", which makes the validator sleep
+    /// for `target_tick_duration` instead of hashing
     pub hashes_per_tick: Option<u64>,
 }
 

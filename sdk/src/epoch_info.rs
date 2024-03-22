@@ -1,6 +1,12 @@
+//! Information about the current epoch.
+//!
+//! As returned by the [`getEpochInfo`] RPC method.
+//!
+//! [`getEpochInfo`]: https://solana.com/docs/rpc/http/getepochinfo
+
 use crate::clock::{Epoch, Slot};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EpochInfo {
     /// The current epoch

@@ -1,47 +1,69 @@
 [package]
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-edition = "2018"
 name = "solana-ledger-tool"
 description = "Blockchain, Rebuilt for Scale"
-version = "1.9.0"
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-ledger-tool"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-bs58 = "0.4.0"
-bytecount = "0.6.2"
-clap = "2.33.1"
-csv = "1.1.6"
-dashmap = "4.0.2"
-histogram = "*"
-itertools = "0.10.1"
-log = { version = "0.4.14" }
-regex = "1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.68"
-serde_yaml = "0.8.21"
-solana-clap-utils = { path = "../clap-utils", version = "=1.9.0" }
-solana-cli-output = { path = "../cli-output", version = "=1.9.0" }
-solana-core = { path = "../core", version = "=1.9.0" }
-solana-entry = { path = "../entry", version = "=1.9.0" }
-solana-ledger = { path = "../ledger", version = "=1.9.0" }
-solana-logger = { path = "../logger", version = "=1.9.0" }
-solana-runtime = { path = "../runtime", version = "=1.9.0" }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-solana-stake-program = { path = "../programs/stake", version = "=1.9.0" }
-solana-storage-bigtable = { path = "../storage-bigtable", version = "=1.9.0" }
-solana-transaction-status = { path = "../transaction-status", version = "=1.9.0" }
-solana-version = { path = "../version", version = "=1.9.0" }
-solana-vote-program = { path = "../programs/vote", version = "=1.9.0" }
-tokio = { version = "1", features = ["full"] }
+bs58 = { workspace = true }
+chrono = { workspace = true, features = ["default"] }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+csv = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+histogram = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+num_cpus = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-bpf-loader-program = { workspace = true }
+solana-clap-utils = { workspace = true }
+solana-cli-output = { workspace = true }
+solana-core = { workspace = true }
+solana-cost-model = { workspace = true }
+solana-entry = { workspace = true }
+solana-geyser-plugin-manager = { workspace = true }
+solana-gossip = { workspace = true }
+solana-ledger = { workspace = true }
+solana-logger = { workspace = true }
+solana-measure = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-rpc = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+solana-sdk = { workspace = true }
+solana-stake-program = { workspace = true }
+solana-storage-bigtable = { workspace = true }
+solana-streamer = { workspace = true }
+solana-transaction-status = { workspace = true }
+solana-unified-scheduler-pool = { workspace = true }
+solana-version = { workspace = true }
+solana-vote-program = { workspace = true }
+solana_rbpf = { workspace = true, features = ["debugger"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+jemallocator = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2.0"
+assert_cmd = { workspace = true }
+bytecount = { workspace = true }
+
+[features]
+dev-context-only-utils = []
 
 [target."cfg(unix)".dependencies]
-signal-hook = "0.2.3"
+signal-hook = { workspace = true }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

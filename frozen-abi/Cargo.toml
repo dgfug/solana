@@ -1,28 +1,36 @@
 [package]
 name = "solana-frozen-abi"
-version = "1.9.0"
 description = "Solana Frozen ABI"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-frozen-abi"
-license = "Apache-2.0"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-bs58 = "0.4.0"
-bv = { version = "0.11.1", features = ["serde"] }
-log = "0.4.14"
-serde = "1.0.130"
-serde_derive = "1.0.103"
-sha2 = "0.9.8"
-solana-frozen-abi-macro = { path = "macro", version = "=1.9.0" }
-thiserror = "1.0"
+bs58 = { workspace = true }
+bv = { workspace = true, features = ["serde"] }
+log = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_bytes = { workspace = true }
+serde_derive = { workspace = true }
+sha2 = { workspace = true }
+solana-frozen-abi-macro = { workspace = true }
+thiserror = { workspace = true }
 
-[target.'cfg(not(target_arch = "bpf"))'.dependencies]
-solana-logger = { path = "../logger", version = "=1.9.0" }
-generic-array = { version = "0.14.4", default-features = false, features = ["serde", "more_lengths"]}
-memmap2 = "0.5.0"
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+block-buffer = { workspace = true }
+either = { workspace = true, features = ["use_std"] }
+generic-array = { workspace = true, features = ["serde", "more_lengths"] }
+im = { workspace = true, features = ["rayon", "serde"] }
+memmap2 = { workspace = true }
+subtle = { workspace = true }
+
+[target.'cfg(not(target_os = "solana"))'.dev-dependencies]
+bitflags = { workspace = true }
+solana-logger = { workspace = true }
 
 [build-dependencies]
-rustc_version = "0.4"
+rustc_version = { workspace = true }

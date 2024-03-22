@@ -1,19 +1,20 @@
-use crate::abi_example::{normalize_type_name, AbiEnumVisitor};
-use crate::hash::{Hash, Hasher};
-use log::*;
-use serde::ser::Error as SerdeError;
-use serde::ser::*;
-use serde::{Serialize, Serializer};
-use std::any::type_name;
-use std::io::Write;
-use thiserror::Error;
+use {
+    crate::{
+        abi_example::{normalize_type_name, AbiEnumVisitor},
+        hash::{Hash, Hasher},
+    },
+    log::*,
+    serde::ser::{Error as SerdeError, *},
+    std::{any::type_name, io::Write},
+    thiserror::Error,
+};
 
 #[derive(Debug)]
 pub struct AbiDigester {
     data_types: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     depth: usize,
     for_enum: bool,
-    opaque_scope: Option<String>,
+    opaque_type_matcher: Option<String>,
 }
 
 pub type DigestResult = Result<AbiDigester, DigestError>;
@@ -32,8 +33,8 @@ pub enum DigestError {
 }
 
 impl SerdeError for DigestError {
-    fn custom<T: std::fmt::Display>(_msg: T) -> DigestError {
-        unreachable!("This error should never be used");
+    fn custom<T: std::fmt::Display>(msg: T) -> DigestError {
+        panic!("Unexpected SerdeError: {msg}");
     }
 }
 
@@ -66,7 +67,7 @@ impl AbiDigester {
             data_types: std::rc::Rc::new(std::cell::RefCell::new(vec![])),
             for_enum: false,
             depth: 0,
-            opaque_scope: None,
+            opaque_type_matcher: None,
         }
     }
 
@@ -77,16 +78,16 @@ impl AbiDigester {
             data_types: self.data_types.clone(),
             depth: self.depth,
             for_enum: false,
-            opaque_scope: self.opaque_scope.clone(),
+            opaque_type_matcher: self.opaque_type_matcher.clone(),
         }
     }
 
-    pub fn create_new_opaque(&self, top_scope: &str) -> Self {
+    pub fn create_new_opaque(&self, type_matcher: &str) -> Self {
         Self {
             data_types: self.data_types.clone(),
             depth: self.depth,
             for_enum: false,
-            opaque_scope: Some(top_scope.to_owned()),
+            opaque_type_matcher: Some(type_matcher.to_owned()),
         }
     }
 
@@ -99,7 +100,7 @@ impl AbiDigester {
             data_types: self.data_types.clone(),
             depth,
             for_enum: false,
-            opaque_scope: self.opaque_scope.clone(),
+            opaque_type_matcher: self.opaque_type_matcher.clone(),
         })
     }
 
@@ -112,15 +113,15 @@ impl AbiDigester {
             data_types: self.data_types.clone(),
             depth,
             for_enum: true,
-            opaque_scope: self.opaque_scope.clone(),
+            opaque_type_matcher: self.opaque_type_matcher.clone(),
         })
     }
 
     pub fn digest_data<T: ?Sized + Serialize>(&mut self, value: &T) -> DigestResult {
         let type_name = normalize_type_name(type_name::<T>());
         if type_name.ends_with("__SerializeWith")
-            || (self.opaque_scope.is_some()
-                && type_name.starts_with(self.opaque_scope.as_ref().unwrap()))
+            || (self.opaque_type_matcher.is_some()
+                && type_name.contains(self.opaque_type_matcher.as_ref().unwrap()))
         {
             // we can't use the AbiEnumVisitor trait for these cases.
             value.serialize(self.create_new())
@@ -176,7 +177,7 @@ impl AbiDigester {
         v: &T,
     ) -> Result<(), DigestError> {
         let field_type_name = shorten_serialize_with(type_name::<T>());
-        self.update_with_string(format!("field {}: {}", key, field_type_name));
+        self.update_with_string(format!("field {key}: {field_type_name}"));
         self.create_child()?
             .digest_data(v)
             .map(|_| ())
@@ -194,7 +195,7 @@ impl AbiDigester {
         label: &'static str,
         variant: &'static str,
     ) -> Result<(), DigestError> {
-        assert!(self.for_enum, "derive AbiEnumVisitor or implement it for the enum, which contains a variant ({}) named {}", label, variant);
+        assert!(self.for_enum, "derive AbiEnumVisitor or implement it for the enum, which contains a variant ({label}) named {variant}");
         Ok(())
     }
 
@@ -216,7 +217,7 @@ impl AbiDigester {
                 error!("Bad thread name detected for dumping; Maybe, --test-threads=1? Sorry, SOLANA_ABI_DUMP_DIR doesn't work under 1; increase it");
             }
 
-            let path = format!("{}/{}_{}", dir, thread_name, hash,);
+            let path = format!("{dir}/{thread_name}_{hash}",);
             let mut file = std::fs::File::create(path).unwrap();
             for buf in (*self.data_types.borrow()).iter() {
                 file.write_all(buf.as_bytes()).unwrap();
@@ -333,7 +334,7 @@ impl Serializer for AbiDigester {
 
     fn serialize_unit_variant(mut self, _name: Sstr, index: u32, variant: Sstr) -> DigestResult {
         self.check_for_enum("unit_variant", variant)?;
-        self.update_with_string(format!("variant({}) {} (unit)", index, variant));
+        self.update_with_string(format!("variant({index}) {variant} (unit)"));
         Ok(self)
     }
 
@@ -375,17 +376,17 @@ impl Serializer for AbiDigester {
             len, 1,
             "Exactly 1 seq element is needed to generate the ABI digest precisely"
         );
-        self.update_with_string(format!("seq (elements = {})", len));
+        self.update_with_string(format!("seq (elements = {len})"));
         self.create_child()
     }
 
     fn serialize_tuple(mut self, len: usize) -> DigestResult {
-        self.update_with_string(format!("tuple (elements = {})", len));
+        self.update_with_string(format!("tuple (elements = {len})"));
         self.create_child()
     }
 
     fn serialize_tuple_struct(mut self, name: Sstr, len: usize) -> DigestResult {
-        self.update_with_string(format!("struct {} (fields = {}) (tuple)", name, len));
+        self.update_with_string(format!("struct {name} (fields = {len}) (tuple)"));
         self.create_child()
     }
 
@@ -397,7 +398,7 @@ impl Serializer for AbiDigester {
         len: usize,
     ) -> DigestResult {
         self.check_for_enum("tuple_variant", variant)?;
-        self.update_with_string(format!("variant({}) {} (fields = {})", i, variant, len));
+        self.update_with_string(format!("variant({i}) {variant} (fields = {len})"));
         self.create_child()
     }
 
@@ -407,12 +408,12 @@ impl Serializer for AbiDigester {
             len, 1,
             "Exactly 1 map entry is needed to generate the ABI digest precisely"
         );
-        self.update_with_string(format!("map (entries = {})", len));
+        self.update_with_string(format!("map (entries = {len})"));
         self.create_child()
     }
 
     fn serialize_struct(mut self, name: Sstr, len: usize) -> DigestResult {
-        self.update_with_string(format!("struct {} (fields = {})", name, len));
+        self.update_with_string(format!("struct {name} (fields = {len})"));
         self.create_child()
     }
 
@@ -424,10 +425,7 @@ impl Serializer for AbiDigester {
         len: usize,
     ) -> DigestResult {
         self.check_for_enum("struct_variant", variant)?;
-        self.update_with_string(format!(
-            "variant({}) struct {} (fields = {})",
-            i, variant, len
-        ));
+        self.update_with_string(format!("variant({i}) struct {variant} (fields = {len})"));
         self.create_child()
     }
 }
@@ -538,8 +536,7 @@ impl SerializeStructVariant for AbiDigester {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicIsize;
+    use std::{collections::HashMap, sync::atomic::AtomicIsize};
 
     #[frozen_abi(digest = "CQiGCzsGquChkwffHjZKFqa3tCYtS3GWYRRYX7iDR38Q")]
     type TestTypeAlias = i32;
@@ -558,6 +555,17 @@ mod tests {
     #[frozen_abi(digest = "FNHa6mNYJZa59Fwbipep5dXRXcFreaDHn9jEUZEH1YLv")]
     #[derive(Serialize, AbiExample)]
     struct TestNewtypeStruct(i8);
+
+    #[frozen_abi(digest = "Hbs1X2X7TF2gFEfsspwfZ1JKr8ZGbLY3uidQBebqcMYt")]
+    #[derive(Serialize, AbiExample)]
+    struct Foo<'a> {
+        #[serde(with = "serde_bytes")]
+        data1: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        data2: &'a [u8],
+        #[serde(with = "serde_bytes")]
+        data3: &'a Vec<u8>,
+    }
 
     #[frozen_abi(digest = "5qio5qYurHDv6fq5kcwP2ue2RBEazSZF8CPk2kUuwC2j")]
     #[derive(Serialize, AbiExample)]
@@ -650,6 +658,34 @@ mod tests {
     #[frozen_abi(digest = "9PMdHRb49BpkywrmPoJyZWMsEmf5E1xgmsFGkGmea5RW")]
     type TestBitVec = bv::BitVec<u64>;
 
+    mod bitflags_abi {
+        use crate::abi_example::{AbiExample, EvenAsOpaque, IgnoreAsHelper};
+
+        bitflags::bitflags! {
+            #[frozen_abi(digest = "HhKNkaeAd7AohTb8S8sPKjAWwzxWY2DPz5FvkWmx5bSH")]
+            #[derive(Serialize, Deserialize)]
+            struct TestFlags: u8 {
+                const TestBit = 0b0000_0001;
+            }
+        }
+
+        impl AbiExample for TestFlags {
+            fn example() -> Self {
+                Self::empty()
+            }
+        }
+
+        impl IgnoreAsHelper for TestFlags {}
+        // This (EvenAsOpaque) marker trait is needed for bitflags-generated types because we can't
+        // impl AbiExample for its private type:
+        // thread '...TestFlags_frozen_abi...' panicked at ...:
+        //   derive or implement AbiExample/AbiEnumVisitor for
+        //   solana_frozen_abi::abi_digester::tests::_::InternalBitFlags
+        impl EvenAsOpaque for TestFlags {
+            const TYPE_NAME_MATCHER: &'static str = "::_::InternalBitFlags";
+        }
+    }
+
     mod skip_should_be_same {
         #[frozen_abi(digest = "4LbuvQLX78XPbm4hqqZcHFHpseDJcw4qZL9EUZXSi2Ss")]
         #[derive(Serialize, AbiExample)]
@@ -680,4 +716,12 @@ mod tests {
             Variant2(u8, u16, #[serde(skip)] u32),
         }
     }
+
+    #[frozen_abi(digest = "B1PcwZdUfGnxaRid9e6ZwkST3NZ2KUEYobA1DkxWrYLP")]
+    #[derive(Serialize, AbiExample)]
+    struct TestArcWeak(std::sync::Weak<u64>);
+
+    #[frozen_abi(digest = "4R8uCLR1BVU1aFgkSaNyKcFD1FeM6rGdsjbJBFpnqx4v")]
+    #[derive(Serialize, AbiExample)]
+    struct TestRcWeak(std::rc::Weak<u64>);
 }

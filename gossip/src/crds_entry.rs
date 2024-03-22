@@ -1,11 +1,10 @@
 use {
     crate::{
-        contact_info::ContactInfo,
         crds::VersionedCrdsValue,
         crds_value::{
-            CrdsData, CrdsValue, CrdsValueLabel, IncrementalSnapshotHashes, LegacyVersion,
-            LowestSlot, SnapshotHashes, Version,
+            CrdsData, CrdsValue, CrdsValueLabel, LegacyVersion, LowestSlot, SnapshotHashes, Version,
         },
+        legacy_contact_info::LegacyContactInfo,
     },
     indexmap::IndexMap,
     solana_sdk::pubkey::Pubkey,
@@ -53,32 +52,24 @@ impl_crds_entry!(CrdsValue, |entry| Some(&entry?.value));
 impl_crds_entry!(VersionedCrdsValue, |entry| entry);
 
 // Lookup by Pubkey.
-impl_crds_entry!(ContactInfo, CrdsData::ContactInfo(node), node);
+impl_crds_entry!(LegacyContactInfo, CrdsData::LegacyContactInfo(node), node);
 impl_crds_entry!(LegacyVersion, CrdsData::LegacyVersion(version), version);
 impl_crds_entry!(LowestSlot, CrdsData::LowestSlot(_, slot), slot);
 impl_crds_entry!(Version, CrdsData::Version(version), version);
 impl_crds_entry!(
-    IncrementalSnapshotHashes,
-    CrdsData::IncrementalSnapshotHashes(incremental_snapshot_hashes),
-    incremental_snapshot_hashes
+    SnapshotHashes,
+    CrdsData::SnapshotHashes(snapshot_hashes),
+    snapshot_hashes
 );
-
-impl<'a, 'b> CrdsEntry<'a, 'b> for &'a SnapshotHashes {
-    type Key = Pubkey;
-    fn get_entry(table: &'a CrdsTable, key: Self::Key) -> Option<Self> {
-        let key = CrdsValueLabel::SnapshotHashes(key);
-        match &table.get(&key)?.value.data {
-            CrdsData::SnapshotHashes(snapshot_hash) => Some(snapshot_hash),
-            _ => None,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::{crds::Crds, crds_value::new_rand_timestamp},
+        crate::{
+            crds::{Crds, GossipRoute},
+            crds_value::new_rand_timestamp,
+        },
         rand::seq::SliceRandom,
         solana_sdk::signature::Keypair,
         std::collections::HashMap,
@@ -94,7 +85,11 @@ mod tests {
             let keypair = keypairs.choose(&mut rng).unwrap();
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             let key = value.label();
-            if let Ok(()) = crds.insert(value.clone(), new_rand_timestamp(&mut rng)) {
+            if let Ok(()) = crds.insert(
+                value.clone(),
+                new_rand_timestamp(&mut rng),
+                GossipRoute::LocalMessage,
+            ) {
                 entries.insert(key, value);
             }
         }
@@ -107,8 +102,8 @@ mod tests {
             assert_eq!(crds.get::<&VersionedCrdsValue>(&key).unwrap().value, *entry);
             let key = entry.pubkey();
             match &entry.data {
-                CrdsData::ContactInfo(node) => {
-                    assert_eq!(crds.get::<&ContactInfo>(key), Some(node))
+                CrdsData::LegacyContactInfo(node) => {
+                    assert_eq!(crds.get::<&LegacyContactInfo>(key), Some(node))
                 }
                 CrdsData::LowestSlot(_, slot) => {
                     assert_eq!(crds.get::<&LowestSlot>(key), Some(slot))
@@ -119,9 +114,6 @@ mod tests {
                 }
                 CrdsData::SnapshotHashes(hash) => {
                     assert_eq!(crds.get::<&SnapshotHashes>(key), Some(hash))
-                }
-                CrdsData::IncrementalSnapshotHashes(hash) => {
-                    assert_eq!(crds.get::<&IncrementalSnapshotHashes>(key), Some(hash))
                 }
                 _ => (),
             }

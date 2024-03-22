@@ -1,11 +1,13 @@
-use chrono::prelude::*;
-use pickledb::{error::Error, PickleDb, PickleDbDumpPolicy};
-use serde::{Deserialize, Serialize};
-use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature, transaction::Transaction};
-use solana_transaction_status::TransactionStatus;
-use std::{cmp::Ordering, fs, io, path::Path};
+use {
+    chrono::prelude::*,
+    pickledb::{error::Error, PickleDb, PickleDbDumpPolicy},
+    serde::{Deserialize, Serialize},
+    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature, transaction::Transaction},
+    solana_transaction_status::TransactionStatus,
+    std::{cmp::Ordering, fs, io, path::Path},
+};
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TransactionInfo {
     pub recipient: Pubkey,
     pub amount: u64,
@@ -16,7 +18,7 @@ pub struct TransactionInfo {
     pub lockup_date: Option<DateTime<Utc>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 struct SignedTransactionInfo {
     recipient: String,
     amount: u64,
@@ -140,9 +142,9 @@ pub fn update_finalized_transaction(
     if opt_transaction_status.is_none() {
         if finalized_block_height > last_valid_block_height {
             eprintln!(
-                "Signature not found {} and blockhash expired. Transaction either dropped or the validator purged the transaction status.",
-                signature
+                "Signature not found {signature} and blockhash expired. Transaction either dropped or the validator purged the transaction status."
             );
+            eprintln!();
 
             // Don't discard the transaction, because we are not certain the
             // blockhash is expired. Instead, return None to signal that
@@ -162,12 +164,9 @@ pub fn update_finalized_transaction(
 
     if let Some(e) = &transaction_status.err {
         // The transaction was finalized, but execution failed. Drop it.
-        eprintln!(
-            "Error in transaction with signature {}: {}",
-            signature,
-            e.to_string()
-        );
+        eprintln!("Error in transaction with signature {signature}: {e}");
         eprintln!("Discarding transaction record");
+        eprintln!();
         db.rem(&signature.to_string())?;
         return Ok(None);
     }
@@ -198,7 +197,7 @@ pub(crate) fn check_output_file(path: &str, db: &PickleDb) {
             new_stake_account_address: info
                 .new_stake_account_address
                 .map(|x| x.to_string())
-                .unwrap_or_else(|| "".to_string()),
+                .unwrap_or_default(),
             finalized_date: info.finalized_date,
             signature: info.transaction.signatures[0].to_string(),
         })
@@ -208,20 +207,23 @@ pub(crate) fn check_output_file(path: &str, db: &PickleDb) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use csv::{ReaderBuilder, Trim};
-    use solana_sdk::transaction::TransactionError;
-    use solana_transaction_status::TransactionConfirmationStatus;
-    use tempfile::NamedTempFile;
+    use {
+        super::*,
+        assert_matches::assert_matches,
+        csv::{ReaderBuilder, Trim},
+        solana_sdk::transaction::TransactionError,
+        solana_transaction_status::TransactionConfirmationStatus,
+        tempfile::NamedTempFile,
+    };
 
     #[test]
     fn test_sort_transaction_infos_finalized_first() {
         let info0 = TransactionInfo {
-            finalized_date: Some(Utc.ymd(2014, 7, 8).and_hms(9, 10, 11)),
+            finalized_date: Some(Utc.with_ymd_and_hms(2014, 7, 8, 9, 10, 11).unwrap()),
             ..TransactionInfo::default()
         };
         let info1 = TransactionInfo {
-            finalized_date: Some(Utc.ymd(2014, 7, 8).and_hms(9, 10, 42)),
+            finalized_date: Some(Utc.with_ymd_and_hms(2014, 7, 8, 9, 10, 42).unwrap()),
             ..TransactionInfo::default()
         };
         let info2 = TransactionInfo::default();
@@ -271,10 +273,10 @@ mod tests {
         let signature = Signature::default();
         let transaction_info = TransactionInfo::default();
         db.set(&signature.to_string(), &transaction_info).unwrap();
-        assert!(matches!(
-            update_finalized_transaction(&mut db, &signature, None, 0, 0).unwrap(),
-            Some(0)
-        ));
+        assert_matches!(
+            update_finalized_transaction(&mut db, &signature, None, 0, 0),
+            Ok(Some(0))
+        );
 
         // Unchanged
         assert_eq!(

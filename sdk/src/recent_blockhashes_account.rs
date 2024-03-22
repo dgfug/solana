@@ -1,16 +1,22 @@
-use crate::account::{
-    create_account_shared_data_with_fields, to_account, AccountSharedData,
-    InheritableAccountFields, DUMMY_INHERITABLE_ACCOUNT_FIELDS,
-};
-use crate::clock::INITIAL_RENT_EPOCH;
+//! Helpers for the recent blockhashes sysvar.
+
 #[allow(deprecated)]
 use solana_program::sysvar::recent_blockhashes::{
     IntoIterSorted, IterItem, RecentBlockhashes, MAX_ENTRIES,
 };
-use std::{collections::BinaryHeap, iter::FromIterator};
+use {
+    crate::{
+        account::{
+            create_account_shared_data_with_fields, to_account, AccountSharedData,
+            InheritableAccountFields, DUMMY_INHERITABLE_ACCOUNT_FIELDS,
+        },
+        clock::INITIAL_RENT_EPOCH,
+    },
+    std::{collections::BinaryHeap, iter::FromIterator},
+};
 
 #[deprecated(
-    since = "1.8.0",
+    since = "1.9.0",
     note = "Please do not use, will no longer be available in the future"
 )]
 #[allow(deprecated)]
@@ -45,7 +51,7 @@ where
 }
 
 #[deprecated(
-    since = "1.8.0",
+    since = "1.9.0",
     note = "Please do not use, will no longer be available in the future"
 )]
 #[allow(deprecated)]
@@ -65,7 +71,7 @@ where
 }
 
 #[deprecated(
-    since = "1.8.0",
+    since = "1.9.0",
     note = "Please do not use, will no longer be available in the future"
 )]
 #[allow(deprecated)]
@@ -79,18 +85,19 @@ where
 #[cfg(test)]
 mod tests {
     #![allow(deprecated)]
-    use super::*;
-    use crate::account::from_account;
-    use rand::{seq::SliceRandom, thread_rng};
-    use solana_program::{
-        fee_calculator::FeeCalculator,
-        hash::{Hash, HASH_BYTES},
-        sysvar::recent_blockhashes::Entry,
+    use {
+        super::*,
+        crate::account::from_account,
+        rand::{seq::SliceRandom, thread_rng},
+        solana_program::{
+            hash::{Hash, HASH_BYTES},
+            sysvar::recent_blockhashes::Entry,
+        },
     };
 
     #[test]
     fn test_create_account_empty() {
-        let account = create_account_with_data_for_test(vec![].into_iter());
+        let account = create_account_with_data_for_test(vec![]);
         let recent_blockhashes = from_account::<RecentBlockhashes, _>(&account).unwrap();
         assert_eq!(recent_blockhashes, RecentBlockhashes::default());
     }
@@ -98,10 +105,15 @@ mod tests {
     #[test]
     fn test_create_account_full() {
         let def_hash = Hash::default();
-        let def_fees = FeeCalculator::default();
-        let account = create_account_with_data_for_test(
-            vec![IterItem(0u64, &def_hash, &def_fees); MAX_ENTRIES].into_iter(),
-        );
+        let def_lamports_per_signature = 0;
+        let account = create_account_with_data_for_test(vec![
+            IterItem(
+                0u64,
+                &def_hash,
+                def_lamports_per_signature
+            );
+            MAX_ENTRIES
+        ]);
         let recent_blockhashes = from_account::<RecentBlockhashes, _>(&account).unwrap();
         assert_eq!(recent_blockhashes.len(), MAX_ENTRIES);
     }
@@ -109,17 +121,22 @@ mod tests {
     #[test]
     fn test_create_account_truncate() {
         let def_hash = Hash::default();
-        let def_fees = FeeCalculator::default();
-        let account = create_account_with_data_for_test(
-            vec![IterItem(0u64, &def_hash, &def_fees); MAX_ENTRIES + 1].into_iter(),
-        );
+        let def_lamports_per_signature = 0;
+        let account = create_account_with_data_for_test(vec![
+            IterItem(
+                0u64,
+                &def_hash,
+                def_lamports_per_signature
+            );
+            MAX_ENTRIES + 1
+        ]);
         let recent_blockhashes = from_account::<RecentBlockhashes, _>(&account).unwrap();
         assert_eq!(recent_blockhashes.len(), MAX_ENTRIES);
     }
 
     #[test]
     fn test_create_account_unsorted() {
-        let def_fees = FeeCalculator::default();
+        let def_lamports_per_signature = 0;
         let mut unsorted_blocks: Vec<_> = (0..MAX_ENTRIES)
             .map(|i| {
                 (i as u64, {
@@ -135,13 +152,13 @@ mod tests {
         let account = create_account_with_data_for_test(
             unsorted_blocks
                 .iter()
-                .map(|(i, hash)| IterItem(*i, hash, &def_fees)),
+                .map(|(i, hash)| IterItem(*i, hash, def_lamports_per_signature)),
         );
         let recent_blockhashes = from_account::<RecentBlockhashes, _>(&account).unwrap();
 
         let mut unsorted_recent_blockhashes: Vec<_> = unsorted_blocks
             .iter()
-            .map(|(i, hash)| IterItem(*i, hash, &def_fees))
+            .map(|(i, hash)| IterItem(*i, hash, def_lamports_per_signature))
             .collect();
         unsorted_recent_blockhashes.sort();
         unsorted_recent_blockhashes.reverse();

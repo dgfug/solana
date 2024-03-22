@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -eo pipefail
 cd "$(dirname "$0")/.."
 
 cargo="$(readlink -f "./cargo")"
@@ -21,60 +21,97 @@ export RUST_BACKTRACE=1
 export RUSTFLAGS="-D warnings"
 source scripts/ulimit-n.sh
 
-# Limit compiler jobs to reduce memory usage
-# on machines with 2gb/thread of memory
-NPROC=$(nproc)
-NPROC=$((NPROC>14 ? 14 : NPROC))
+#shellcheck source=ci/common/limit-threads.sh
+source ci/common/limit-threads.sh
+
+# get channel info
+eval "$(ci/channel-info.sh)"
+
+#shellcheck source=ci/common/shared-functions.sh
+source ci/common/shared-functions.sh
 
 echo "Executing $testName"
 case $testName in
 test-stable)
-  _ "$cargo" stable test --jobs "$NPROC" --all --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
+  _ ci/intercept.sh cargo test --jobs "$JOBS" --all --tests --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
   ;;
-test-stable-bpf)
+test-stable-sbf)
   # Clear the C dependency files, if dependency moves these files are not regenerated
-  test -d target/debug/bpf && find target/debug/bpf -name '*.d' -delete
-  test -d target/release/bpf && find target/release/bpf -name '*.d' -delete
+  test -d target/debug/sbf && find target/debug/sbf -name '*.d' -delete
+  test -d target/release/sbf && find target/release/sbf -name '*.d' -delete
 
-  # rustfilt required for dumping BPF assembly listings
+  # rustfilt required for dumping SBF assembly listings
   "$cargo" install rustfilt
 
   # solana-keygen required when building C programs
   _ "$cargo" build --manifest-path=keygen/Cargo.toml
 
   export PATH="$PWD/target/debug":$PATH
-  cargo_build_bpf="$(realpath ./cargo-build-bpf)"
-  cargo_test_bpf="$(realpath ./cargo-test-bpf)"
+  cargo_build_sbf="$(realpath ./cargo-build-sbf)"
+  cargo_test_sbf="$(realpath ./cargo-test-sbf)"
 
-  # BPF solana-sdk legacy compile test
-  "$cargo_build_bpf" --manifest-path sdk/Cargo.toml
+  # SBF solana-sdk legacy compile test
+  "$cargo_build_sbf" --manifest-path sdk/Cargo.toml
 
-  # BPF C program system tests
-  _ make -C programs/bpf/c tests
-  _ "$cargo" stable test \
-    --manifest-path programs/bpf/Cargo.toml \
-    --no-default-features --features=bpf_c,bpf_rust -- --nocapture
+  # Ensure the minimum supported "rust-version" matches platform tools to fail
+  # quickly if users try to build with an older platform tools install
+  cargo_toml=sdk/program/Cargo.toml
+  source "scripts/read-cargo-variable.sh"
+  crate_rust_version=$(readCargoVariable rust-version $cargo_toml)
+  platform_tools_rust_version=$("$cargo_build_sbf" --version | grep rustc)
+  platform_tools_rust_version=$(echo "$platform_tools_rust_version" | cut -d\  -f2) # Remove "rustc " prefix from a string like "rustc 1.68.0-dev"
+  platform_tools_rust_version=$(echo "$platform_tools_rust_version" | cut -d- -f1)  # Remove "-dev" suffix from a string like "1.68.0-dev"
 
-  # BPF Rust program unit tests
-  for bpf_test in programs/bpf/rust/*; do
-    if pushd "$bpf_test"; then
+  if [[ $crate_rust_version != "$platform_tools_rust_version" ]]; then
+    echo "Error: Update 'rust-version' field in '$cargo_toml' from $crate_rust_version to $platform_tools_rust_version"
+    exit 1
+  fi
+
+  # SBF C program system tests
+  _ make -C programs/sbf/c tests
+  _ cargo test \
+    --manifest-path programs/sbf/Cargo.toml \
+    --no-default-features --features=sbf_c,sbf_rust -- --nocapture
+
+  # SBF Rust program unit tests
+  for sbf_test in programs/sbf/rust/*; do
+    if pushd "$sbf_test"; then
       "$cargo" test
-      "$cargo_build_bpf" --bpf-sdk ../../../../sdk/bpf --dump
-      "$cargo_test_bpf" --bpf-sdk ../../../../sdk/bpf
+      "$cargo_build_sbf" --sbf-sdk ../../../../sdk/sbf --dump
+      "$cargo_test_sbf" --sbf-sdk ../../../../sdk/sbf
       popd
     fi
-  done
+  done |& tee cargo.log
+  # Save the output of cargo building the sbf tests so we can analyze
+  # the number of redundant rebuilds of dependency crates. The
+  # expected number of solana-program crate compilations is 4. There
+  # should be 3 builds of solana-program while 128bit crate is
+  # built. These compilations are not redundant because the crate is
+  # built for different target each time. An additional compilation of
+  # solana-program is performed when simulation crate is built. This
+  # last compiled solana-program is of different version, normally the
+  # latest mainbeta release version.
+  solana_program_count=$(grep -c 'solana-program v' cargo.log)
+  rm -f cargo.log
+  if ((solana_program_count > 20)); then
+      echo "Regression of build redundancy ${solana_program_count}."
+      echo "Review dependency features that trigger redundant rebuilds of solana-program."
+      exit 1
+  fi
 
-  # BPF program instruction count assertion
-  bpf_target_path=programs/bpf/target
-  _ "$cargo" stable test \
-    --manifest-path programs/bpf/Cargo.toml \
-    --no-default-features --features=bpf_c,bpf_rust assert_instruction_count \
-    -- --nocapture &> "${bpf_target_path}"/deploy/instuction_counts.txt
+  # platform-tools version
+  "$cargo_build_sbf" -V
 
-  bpf_dump_archive="bpf-dumps.tar.bz2"
-  rm -f "$bpf_dump_archive"
-  tar cjvf "$bpf_dump_archive" "${bpf_target_path}"/{deploy/*.txt,bpfel-unknown-unknown/release/*.so}
+  # SBF program instruction count assertion
+  sbf_target_path=programs/sbf/target
+  _ cargo test \
+    --manifest-path programs/sbf/Cargo.toml \
+    --no-default-features --features=sbf_c,sbf_rust assert_instruction_count \
+    -- --nocapture &> "${sbf_target_path}"/deploy/instruction_counts.txt
+
+  sbf_dump_archive="sbf-dumps.tar.bz2"
+  rm -f "$sbf_dump_archive"
+  tar cjvf "$sbf_dump_archive" "${sbf_target_path}"/{deploy/*.txt,sbf-solana-solana/release/*.so}
   exit 0
   ;;
 test-stable-perf)
@@ -94,13 +131,25 @@ test-stable-perf)
     export SOLANA_CUDA=1
   fi
 
-  _ "$cargo" stable build --bins ${V:+--verbose}
-  _ "$cargo" stable test --package solana-perf --package solana-ledger --package solana-core --lib ${V:+--verbose} -- --nocapture
-  _ "$cargo" stable run --manifest-path poh-bench/Cargo.toml ${V:+--verbose} -- --hashes-per-tick 10
+  _ cargo build --bins ${V:+--verbose}
+  _ cargo test --package solana-perf --package solana-ledger --package solana-core --lib ${V:+--verbose} -- --nocapture
+  _ cargo run --manifest-path poh-bench/Cargo.toml ${V:+--verbose} -- --hashes-per-tick 10
   ;;
-test-local-cluster)
-  _ "$cargo" stable build --release --bins ${V:+--verbose}
-  _ "$cargo" stable test --release --package solana-local-cluster ${V:+--verbose} -- --nocapture --test-threads=1
+test-wasm)
+  _ node --version
+  _ npm --version
+  for dir in sdk/{program,}; do
+    if [[ -r "$dir"/package.json ]]; then
+      pushd "$dir"
+      _ npm install
+      _ npm test
+      popd
+    fi
+  done
+  exit 0
+  ;;
+test-docs)
+  _ cargo test --jobs "$JOBS" --all --doc --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
   exit 0
   ;;
 *)
@@ -110,6 +159,7 @@ esac
 
 (
   export CARGO_TOOLCHAIN=+"$rust_stable"
+  export RUST_LOG="solana_metrics=warn,info,$RUST_LOG"
   echo --- ci/localnet-sanity.sh
   ci/localnet-sanity.sh -x
 

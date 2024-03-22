@@ -6,10 +6,11 @@ use {
     },
     chrono::{Local, TimeZone},
     console::{style, Emoji},
+    crossbeam_channel::unbounded,
     indicatif::{ProgressBar, ProgressStyle},
     serde::{Deserialize, Serialize},
-    solana_client::rpc_client::RpcClient,
     solana_config_program::{config_instruction, get_config_data, ConfigState},
+    solana_rpc_client::rpc_client::RpcClient,
     solana_sdk::{
         hash::{Hash, Hasher},
         message::Message,
@@ -21,7 +22,6 @@ use {
         fs::{self, File},
         io::{self, BufReader, Read},
         path::{Path, PathBuf},
-        sync::mpsc,
         time::{Duration, Instant, SystemTime},
     },
     tempfile::TempDir,
@@ -47,9 +47,12 @@ static RECYCLING: Emoji = Emoji("♻️  ", "");
 /// Creates a new process bar for processing that will take an unknown amount of time
 fn new_spinner_progress_bar() -> ProgressBar {
     let progress_bar = ProgressBar::new(42);
-    progress_bar
-        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
-    progress_bar.enable_steady_tick(100);
+    progress_bar.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {wide_msg}")
+            .expect("ProgresStyle::template direct input to be correct"),
+    );
+    progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar
 }
 
@@ -86,15 +89,18 @@ fn download_to_temp(
         Ok(hasher.result())
     }
 
-    let url = Url::parse(url).map_err(|err| format!("Unable to parse {}: {}", url, err))?;
+    let url = Url::parse(url).map_err(|err| format!("Unable to parse {url}: {err}"))?;
 
     let temp_dir = TempDir::new()?;
     let temp_file = temp_dir.path().join("download");
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(None)
+        .build()?;
 
     let progress_bar = new_spinner_progress_bar();
-    progress_bar.set_message(format!("{}Downloading...", TRUCK));
+    progress_bar.set_message(format!("{TRUCK}Downloading..."));
 
     let response = client.get(url.as_str()).send()?;
     let download_size = {
@@ -112,9 +118,10 @@ fn download_to_temp(
             .template(
                 "{spinner:.green}{wide_msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
             )
+            .expect("ProgresStyle::template direct input to be correct")
             .progress_chars("=> "),
     );
-    progress_bar.set_message(format!("{}Downloading", TRUCK));
+    progress_bar.set_message(format!("{TRUCK}Downloading"));
 
     struct DownloadProgress<R> {
         progress_bar: ProgressBar,
@@ -139,7 +146,7 @@ fn download_to_temp(
     std::io::copy(&mut source, &mut file)?;
 
     let temp_file_sha256 = sha256_file_digest(&temp_file)
-        .map_err(|err| format!("Unable to hash {:?}: {}", temp_file, err))?;
+        .map_err(|err| format!("Unable to hash {temp_file:?}: {err}"))?;
 
     if expected_sha256.is_some() && expected_sha256 != Some(&temp_file_sha256) {
         return Err(io::Error::new(io::ErrorKind::Other, "Incorrect hash").into());
@@ -154,14 +161,13 @@ fn extract_release_archive(
     archive: &Path,
     extract_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use bzip2::bufread::BzDecoder;
-    use tar::Archive;
+    use {bzip2::bufread::BzDecoder, tar::Archive};
 
     let progress_bar = new_spinner_progress_bar();
-    progress_bar.set_message(format!("{}Extracting...", PACKAGE));
+    progress_bar.set_message(format!("{PACKAGE}Extracting..."));
 
     if extract_dir.exists() {
-        let _ = fs::remove_dir_all(&extract_dir);
+        let _ = fs::remove_dir_all(extract_dir);
     }
 
     let tmp_extract_dir = extract_dir.with_file_name("tmp-extract");
@@ -182,10 +188,10 @@ fn extract_release_archive(
 }
 
 fn load_release_version(version_yml: &Path) -> Result<ReleaseVersion, String> {
-    let file = File::open(&version_yml)
-        .map_err(|err| format!("Unable to open {:?}: {:?}", version_yml, err))?;
+    let file = File::open(version_yml)
+        .map_err(|err| format!("Unable to open {version_yml:?}: {err:?}"))?;
     let version: ReleaseVersion = serde_yaml::from_reader(file)
-        .map_err(|err| format!("Unable to parse {:?}: {:?}", version_yml, err))?;
+        .map_err(|err| format!("Unable to parse {version_yml:?}: {err:?}"))?;
     Ok(version)
 }
 
@@ -267,13 +273,13 @@ fn get_update_manifest(
 ) -> Result<UpdateManifest, String> {
     let data = rpc_client
         .get_account_data(update_manifest_pubkey)
-        .map_err(|err| format!("Unable to fetch update manifest: {}", err))?;
+        .map_err(|err| format!("Unable to fetch update manifest: {err}"))?;
 
     let config_data = get_config_data(&data)
-        .map_err(|err| format!("Unable to get at config_data to update manifest: {}", err))?;
+        .map_err(|err| format!("Unable to get at config_data to update manifest: {err}"))?;
     let signed_update_manifest =
         SignedUpdateManifest::deserialize(update_manifest_pubkey, config_data)
-            .map_err(|err| format!("Unable to deserialize update manifest: {}", err))?;
+            .map_err(|err| format!("Unable to deserialize update manifest: {err}"))?;
     Ok(signed_update_manifest.manifest)
 }
 
@@ -308,8 +314,7 @@ fn check_env_path_for_bin_dir(config: &Config) {
 /// Encodes a UTF-8 string as a null-terminated UCS-2 string in bytes
 #[cfg(windows)]
 pub fn string_to_winreg_bytes(s: &str) -> Vec<u8> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStrExt;
+    use std::{ffi::OsString, os::windows::ffi::OsStrExt};
     let v: Vec<_> = OsString::from(format!("{}\x00", s)).encode_wide().collect();
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2).to_vec() }
 }
@@ -320,8 +325,7 @@ pub fn string_to_winreg_bytes(s: &str) -> Vec<u8> {
 // conversion.
 #[cfg(windows)]
 pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
-    use std::slice;
-    use winreg::enums::RegType;
+    use {std::slice, winreg::enums::RegType};
 
     match val.vtype {
         RegType::REG_SZ | RegType::REG_EXPAND_SZ => {
@@ -329,9 +333,7 @@ pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
             let words = unsafe {
                 slice::from_raw_parts(val.bytes.as_ptr() as *const u16, val.bytes.len() / 2)
             };
-            let mut s = if let Ok(s) = String::from_utf16(words) {
-                s
-            } else {
+            let Ok(mut s) = String::from_utf16(words) else {
                 return None;
             };
             while s.ends_with('\u{0}') {
@@ -347,8 +349,10 @@ pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
 // should not mess with it.
 #[cfg(windows)]
 fn get_windows_path_var() -> Result<Option<String>, String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
-    use winreg::RegKey;
+    use winreg::{
+        enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
+        RegKey,
+    };
 
     let root = RegKey::predef(HKEY_CURRENT_USER);
     let environment = root
@@ -372,23 +376,27 @@ fn get_windows_path_var() -> Result<Option<String>, String> {
 
 #[cfg(windows)]
 fn add_to_path(new_path: &str) -> bool {
-    use std::ptr;
-    use winapi::shared::minwindef::*;
-    use winapi::um::winuser::{
-        SendMessageTimeoutA, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    use {
+        std::ptr,
+        winapi::{
+            shared::minwindef::*,
+            um::winuser::{
+                SendMessageTimeoutA, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+            },
+        },
+        winreg::{
+            enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
+            RegKey, RegValue,
+        },
     };
-    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
-    use winreg::{RegKey, RegValue};
 
-    let old_path = if let Some(s) =
+    let Some(old_path) =
         get_windows_path_var().unwrap_or_else(|err| panic!("Unable to get PATH: {}", err))
-    {
-        s
-    } else {
+    else {
         return false;
     };
 
-    if !old_path.contains(&new_path) {
+    if !old_path.contains(new_path) {
         let mut new_path = new_path.to_string();
         if !old_path.is_empty() {
             new_path.push(';');
@@ -436,7 +444,7 @@ fn add_to_path(new_path: &str) -> bool {
 
 #[cfg(unix)]
 fn add_to_path(new_path: &str) -> bool {
-    let shell_export_string = format!("\nexport PATH=\"{}:$PATH\"", new_path);
+    let shell_export_string = format!("\nexport PATH=\"{new_path}:$PATH\"");
     let mut modified_rcfiles = false;
 
     // Look for sh, bash, and zsh rc files
@@ -476,7 +484,7 @@ fn add_to_path(new_path: &str) -> bool {
 
         match read_file(&rcfile) {
             Err(err) => {
-                println!("Unable to read {:?}: {}", rcfile, err);
+                println!("Unable to read {rcfile:?}: {err}");
             }
             Ok(contents) => {
                 if !contents.contains(&shell_export_string) {
@@ -489,19 +497,18 @@ fn add_to_path(new_path: &str) -> bool {
                     fn append_file(dest: &Path, line: &str) -> io::Result<()> {
                         use std::io::Write;
                         let mut dest_file = fs::OpenOptions::new()
-                            .write(true)
                             .append(true)
                             .create(true)
                             .open(dest)?;
 
-                        writeln!(&mut dest_file, "{}", line)?;
+                        writeln!(&mut dest_file, "{line}")?;
 
                         dest_file.sync_data()?;
 
                         Ok(())
                     }
                     append_file(&rcfile, &shell_export_string).unwrap_or_else(|err| {
-                        format!("Unable to append to {:?}: {}", rcfile, err);
+                        format!("Unable to append to {rcfile:?}: {err}");
                     });
                     modified_rcfiles = true;
                 }
@@ -569,7 +576,7 @@ fn github_release_download_url(release_semver: &str) -> String {
 
 fn release_channel_download_url(release_channel: &str) -> String {
     format!(
-        "http://release.solana.com/{}/solana-release-{}.tar.bz2",
+        "https://release.solana.com/{}/solana-release-{}.tar.bz2",
         release_channel,
         crate::build_env::TARGET
     )
@@ -577,17 +584,19 @@ fn release_channel_download_url(release_channel: &str) -> String {
 
 fn release_channel_version_url(release_channel: &str) -> String {
     format!(
-        "http://release.solana.com/{}/solana-release-{}.yml",
+        "https://release.solana.com/{}/solana-release-{}.yml",
         release_channel,
         crate::build_env::TARGET
     )
 }
 
 fn print_update_manifest(update_manifest: &UpdateManifest) {
-    let when = Local.timestamp(update_manifest.timestamp_secs as i64, 0);
-    println_name_value(&format!("{}release date:", BULLET), &when.to_string());
+    let when = Local
+        .timestamp_opt(update_manifest.timestamp_secs as i64, 0)
+        .unwrap();
+    println_name_value(&format!("{BULLET}release date:"), &when.to_string());
     println_name_value(
-        &format!("{}download URL:", BULLET),
+        &format!("{BULLET}download URL:"),
         &update_manifest.download_url,
     );
 }
@@ -607,7 +616,7 @@ pub fn info(config_file: &str, local_info_only: bool, eval: bool) -> Result<(), 
                 ExplicitRelease::Channel(channel) => channel,
             })
             .and_then(|channel| {
-                println!("SOLANA_INSTALL_ACTIVE_CHANNEL={}", channel,);
+                println!("SOLANA_INSTALL_ACTIVE_CHANNEL={channel}",);
                 Option::<String>::None
             });
         return Ok(());
@@ -624,7 +633,7 @@ pub fn info(config_file: &str, local_info_only: bool, eval: bool) -> Result<(), 
             load_release_version(&config.active_release_dir().join("version.yml"))
         {
             println_name_value(
-                &format!("{}Release commit:", BULLET),
+                &format!("{BULLET}Release commit:"),
                 &release_version.commit[0..7],
             );
         }
@@ -633,16 +642,16 @@ pub fn info(config_file: &str, local_info_only: bool, eval: bool) -> Result<(), 
     if let Some(explicit_release) = &config.explicit_release {
         match explicit_release {
             ExplicitRelease::Semver(release_semver) => {
-                println_name_value(&format!("{}Release version:", BULLET), release_semver);
+                println_name_value(&format!("{BULLET}Release version:"), release_semver);
                 println_name_value(
-                    &format!("{}Release URL:", BULLET),
+                    &format!("{BULLET}Release URL:"),
                     &github_release_download_url(release_semver),
                 );
             }
             ExplicitRelease::Channel(release_channel) => {
-                println_name_value(&format!("{}Release channel:", BULLET), release_channel);
+                println_name_value(&format!("{BULLET}Release channel:"), release_channel);
                 println_name_value(
-                    &format!("{}Release URL:", BULLET),
+                    &format!("{BULLET}Release URL:"),
                     &release_channel_download_url(release_channel),
                 );
             }
@@ -681,9 +690,9 @@ pub fn deploy(
     update_manifest_keypair_file: &str,
 ) -> Result<(), String> {
     let from_keypair = read_keypair_file(from_keypair_file)
-        .map_err(|err| format!("Unable to read {}: {}", from_keypair_file, err))?;
+        .map_err(|err| format!("Unable to read {from_keypair_file}: {err}"))?;
     let update_manifest_keypair = read_keypair_file(update_manifest_keypair_file)
-        .map_err(|err| format!("Unable to read {}: {}", update_manifest_keypair_file, err))?;
+        .map_err(|err| format!("Unable to read {update_manifest_keypair_file}: {err}"))?;
 
     println_name_value("JSON RPC URL:", json_rpc_url);
     println_name_value(
@@ -694,23 +703,20 @@ pub fn deploy(
     // Confirm the `json_rpc_url` is good and that `from_keypair` is a valid account
     let rpc_client = RpcClient::new(json_rpc_url.to_string());
     let progress_bar = new_spinner_progress_bar();
-    progress_bar.set_message(format!("{}Checking cluster...", LOOKING_GLASS));
+    progress_bar.set_message(format!("{LOOKING_GLASS}Checking cluster..."));
     let balance = rpc_client
         .get_balance(&from_keypair.pubkey())
         .map_err(|err| {
-            format!(
-                "Unable to get the account balance of {}: {}",
-                from_keypair_file, err
-            )
+            format!("Unable to get the account balance of {from_keypair_file}: {err}")
         })?;
     progress_bar.finish_and_clear();
     if balance == 0 {
-        return Err(format!("{} account balance is empty", from_keypair_file));
+        return Err(format!("{from_keypair_file} account balance is empty"));
     }
 
     // Download the release
     let (temp_dir, temp_archive, temp_archive_sha256) = download_to_temp(download_url, None)
-        .map_err(|err| format!("Unable to download {}: {}", download_url, err))?;
+        .map_err(|err| format!("Unable to download {download_url}: {err}"))?;
 
     if let Ok(update_manifest) = get_update_manifest(&rpc_client, &update_manifest_keypair.pubkey())
     {
@@ -727,23 +733,16 @@ pub fn deploy(
     // Extract it and load the release version metadata
     let temp_release_dir = temp_dir.path().join("archive");
     extract_release_archive(&temp_archive, &temp_release_dir).map_err(|err| {
-        format!(
-            "Unable to extract {:?} into {:?}: {}",
-            temp_archive, temp_release_dir, err
-        )
+        format!("Unable to extract {temp_archive:?} into {temp_release_dir:?}: {err}")
     })?;
 
-    let release_target = load_release_target(&temp_release_dir).map_err(|err| {
-        format!(
-            "Unable to load release target from {:?}: {}",
-            temp_release_dir, err
-        )
-    })?;
+    let release_target = load_release_target(&temp_release_dir)
+        .map_err(|err| format!("Unable to load release target from {temp_release_dir:?}: {err}"))?;
 
     println_name_value("Update target:", &release_target);
 
     let progress_bar = new_spinner_progress_bar();
-    progress_bar.set_message(format!("{}Deploying update...", PACKAGE));
+    progress_bar.set_message(format!("{PACKAGE}Deploying update..."));
 
     // Construct an update manifest for the release
     let mut update_manifest = SignedUpdateManifest {
@@ -760,14 +759,14 @@ pub fn deploy(
 
     // Store the new update manifest on the cluster
     new_update_manifest(&rpc_client, &from_keypair, &update_manifest_keypair)
-        .map_err(|err| format!("Unable to create update manifest: {}", err))?;
+        .map_err(|err| format!("Unable to create update manifest: {err}"))?;
     store_update_manifest(
         &rpc_client,
         &from_keypair,
         &update_manifest_keypair,
         &update_manifest,
     )
-    .map_err(|err| format!("Unable to store update manifest: {:?}", err))?;
+    .map_err(|err| format!("Unable to store update manifest: {err:?}"))?;
 
     progress_bar.finish_and_clear();
     println!("  {}{}", SPARKLE, style("Deployment successful").bold());
@@ -823,12 +822,13 @@ pub fn gc(config_file: &str) -> Result<(), String> {
             progress_bar.set_style(
                 ProgressStyle::default_bar()
                     .template("{spinner:.green}{wide_msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                    .expect("ProgresStyle::template direct input to be correct")
                     .progress_chars("=> "),
             );
-            progress_bar.set_message(format!("{}Removing old releases", RECYCLING));
+            progress_bar.set_message(format!("{RECYCLING}Removing old releases"));
             for (release, _modified_type) in old_releases {
                 progress_bar.inc(1);
-                let _ = fs::remove_dir_all(&release);
+                let _ = fs::remove_dir_all(release);
             }
             progress_bar.finish_and_clear();
         }
@@ -844,6 +844,11 @@ pub struct GithubRelease {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct GithubError {
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GithubReleases(Vec<GithubRelease>);
 
 fn semver_of(string: &str) -> Result<semver::Version, String> {
@@ -856,44 +861,95 @@ fn semver_of(string: &str) -> Result<semver::Version, String> {
 }
 
 fn check_for_newer_github_release(
-    version_filter: Option<semver::VersionReq>,
+    current_release_semver: &str,
+    semver_update_type: SemverUpdateType,
     prerelease_allowed: bool,
-) -> reqwest::Result<Option<String>> {
-    let url =
-        reqwest::Url::parse("https://api.github.com/repos/solana-labs/solana/releases").unwrap();
+) -> Result<Option<String>, String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("solana-install")
-        .build()?;
-    let request = client.get(url).build()?;
-    let response = client.execute(request)?;
+        .build()
+        .map_err(|err| err.to_string())?;
 
-    let mut releases = response
-        .json::<GithubReleases>()?
-        .0
-        .into_iter()
-        .filter_map(
-            |GithubRelease {
-                 tag_name,
-                 prerelease,
-             }| {
-                if let Ok(version) = semver_of(&tag_name) {
-                    if (prerelease_allowed || !prerelease)
-                        && version_filter
-                            .as_ref()
-                            .map_or(true, |version_filter| version_filter.matches(&version))
-                    {
-                        return Some(version);
-                    }
-                }
-                None
-            },
+    // If we want a fixed version, we don't need to stress the API to check whether it exists
+    if semver_update_type == SemverUpdateType::Fixed {
+        let download_url = github_release_download_url(current_release_semver);
+        let response = client
+            .head(download_url.as_str())
+            .send()
+            .map_err(|err| err.to_string())?;
+
+        if response.status() == reqwest::StatusCode::OK {
+            return Ok(Some(current_release_semver.to_string()));
+        }
+    }
+
+    let version_filter = semver::VersionReq::parse(&format!(
+        "{}{}",
+        match semver_update_type {
+            SemverUpdateType::Fixed => "=",
+            SemverUpdateType::Patch => "~",
+            SemverUpdateType::_Minor => "^",
+        },
+        current_release_semver
+    ))
+    .ok();
+
+    let mut page = 1;
+    const PER_PAGE: usize = 100;
+    let mut all_releases = vec![];
+    let mut releases = vec![];
+
+    while page == 1 || releases.len() == PER_PAGE {
+        let url = reqwest::Url::parse_with_params(
+            "https://api.github.com/repos/solana-labs/solana/releases",
+            &[
+                ("per_page", &format!("{PER_PAGE}")),
+                ("page", &format!("{page}")),
+            ],
         )
-        .collect::<Vec<_>>();
+        .unwrap();
+        let request = client.get(url).build().map_err(|err| err.to_string())?;
+        let response = client.execute(request).map_err(|err| err.to_string())?;
 
-    releases.sort();
-    Ok(releases.pop().map(|r| r.to_string()))
+        if response.status() == reqwest::StatusCode::OK {
+            releases = response
+                .json::<GithubReleases>()
+                .map_err(|err| err.to_string())?
+                .0
+                .into_iter()
+                .filter_map(
+                    |GithubRelease {
+                         tag_name,
+                         prerelease,
+                     }| {
+                        if let Ok(version) = semver_of(&tag_name) {
+                            if (prerelease_allowed || !prerelease)
+                                && version_filter
+                                    .as_ref()
+                                    .map_or(true, |version_filter| version_filter.matches(&version))
+                            {
+                                return Some(version);
+                            }
+                        }
+                        None
+                    },
+                )
+                .collect::<Vec<_>>();
+            all_releases.extend_from_slice(&releases);
+            page += 1;
+        } else {
+            return Err(response
+                .json::<GithubError>()
+                .map_err(|err| err.to_string())?
+                .message);
+        }
+    }
+
+    all_releases.sort();
+    Ok(all_releases.pop().map(|r| r.to_string()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum SemverUpdateType {
     Fixed,
     Patch,
@@ -907,67 +963,62 @@ pub fn update(config_file: &str, check_only: bool) -> Result<bool, String> {
 pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Result<bool, String> {
     let mut config = Config::load(config_file)?;
 
-    let semver_update_type = if is_init {
-        SemverUpdateType::Fixed
-    } else {
-        SemverUpdateType::Patch
-    };
-
     let (updated_version, download_url_and_sha256, release_dir) = if let Some(explicit_release) =
         &config.explicit_release
     {
         match explicit_release {
             ExplicitRelease::Semver(current_release_semver) => {
-                let progress_bar = new_spinner_progress_bar();
-                progress_bar.set_message(format!("{}Checking for updates...", LOOKING_GLASS));
+                let release_dir = config.release_dir(current_release_semver);
+                if is_init && release_dir.exists() {
+                    (current_release_semver.to_owned(), None, release_dir)
+                } else {
+                    let progress_bar = new_spinner_progress_bar();
+                    progress_bar.set_message(format!("{LOOKING_GLASS}Checking for updates..."));
 
-                let github_release = check_for_newer_github_release(
-                    semver::VersionReq::parse(&format!(
-                        "{}{}",
-                        match semver_update_type {
-                            SemverUpdateType::Fixed => "=",
-                            SemverUpdateType::Patch => "~",
-                            SemverUpdateType::_Minor => "^",
-                        },
-                        current_release_semver
-                    ))
-                    .ok(),
-                    is_init,
-                )
-                .map_err(|err| err.to_string())?;
-                progress_bar.finish_and_clear();
+                    let semver_update_type = if is_init {
+                        SemverUpdateType::Fixed
+                    } else {
+                        SemverUpdateType::Patch
+                    };
+                    let github_release = check_for_newer_github_release(
+                        current_release_semver,
+                        semver_update_type,
+                        is_init,
+                    )?;
 
-                match github_release {
-                    None => {
-                        return Err(format!("Unknown release: {}", current_release_semver));
-                    }
-                    Some(release_semver) => {
-                        if release_semver == *current_release_semver {
-                            if let Ok(active_release_version) = load_release_version(
-                                &config.active_release_dir().join("version.yml"),
-                            ) {
-                                if format!("v{}", current_release_semver)
-                                    == active_release_version.channel
-                                {
-                                    println!(
-                                        "Install is up to date. {} is the latest compatible release",
-                                        release_semver
+                    progress_bar.finish_and_clear();
+
+                    match github_release {
+                        None => {
+                            return Err(format!("Unknown release: {current_release_semver}"));
+                        }
+                        Some(release_semver) => {
+                            if release_semver == *current_release_semver {
+                                if let Ok(active_release_version) = load_release_version(
+                                    &config.active_release_dir().join("version.yml"),
+                                ) {
+                                    if format!("v{current_release_semver}")
+                                        == active_release_version.channel
+                                    {
+                                        println!(
+                                        "Install is up to date. {release_semver} is the latest compatible release"
                                     );
-                                    return Ok(false);
+                                        return Ok(false);
+                                    }
                                 }
                             }
-                        }
-                        config.explicit_release =
-                            Some(ExplicitRelease::Semver(release_semver.clone()));
+                            config.explicit_release =
+                                Some(ExplicitRelease::Semver(release_semver.clone()));
 
-                        let release_dir = config.release_dir(&release_semver);
-                        let download_url_and_sha256 = if release_dir.exists() {
-                            // Release already present in the cache
-                            None
-                        } else {
-                            Some((github_release_download_url(&release_semver), None))
-                        };
-                        (release_semver, download_url_and_sha256, release_dir)
+                            let release_dir = config.release_dir(&release_semver);
+                            let download_url_and_sha256 = if release_dir.exists() {
+                                // Release already present in the cache
+                                None
+                            } else {
+                                Some((github_release_download_url(&release_semver), None))
+                            };
+                            (release_semver, download_url_and_sha256, release_dir)
+                        }
                     }
                 }
             }
@@ -976,7 +1027,7 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
 
                 let (_temp_dir, temp_file, _temp_archive_sha256) =
                     download_to_temp(&version_url, None)
-                        .map_err(|err| format!("Unable to download {}: {}", version_url, err))?;
+                        .map_err(|err| format!("Unable to download {version_url}: {err}"))?;
 
                 let update_release_version = load_release_version(&temp_file)?;
 
@@ -1041,7 +1092,7 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         }
     } else {
         let progress_bar = new_spinner_progress_bar();
-        progress_bar.set_message(format!("{}Checking for updates...", LOOKING_GLASS));
+        progress_bar.set_message(format!("{LOOKING_GLASS}Checking for updates..."));
         let rpc_client = RpcClient::new(config.json_rpc_url.clone());
         let update_manifest = get_update_manifest(&rpc_client, &config.update_manifest_pubkey)?;
         progress_bar.finish_and_clear();
@@ -1083,7 +1134,7 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         println!(
             "  {}{}",
             WRAPPED_PRESENT,
-            style(format!("Update available: {}", updated_version)).bold()
+            style(format!("Update available: {updated_version}")).bold()
         );
         return Ok(true);
     }
@@ -1091,24 +1142,17 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
     if let Some((download_url, archive_sha256)) = download_url_and_sha256 {
         let (_temp_dir, temp_archive, _temp_archive_sha256) =
             download_to_temp(&download_url, archive_sha256.as_ref())
-                .map_err(|err| format!("Unable to download {}: {}", download_url, err))?;
+                .map_err(|err| format!("Unable to download {download_url}: {err}"))?;
         extract_release_archive(&temp_archive, &release_dir).map_err(|err| {
-            format!(
-                "Unable to extract {:?} to {:?}: {}",
-                temp_archive, release_dir, err
-            )
+            format!("Unable to extract {temp_archive:?} to {release_dir:?}: {err}")
         })?;
     }
 
-    let release_target = load_release_target(&release_dir).map_err(|err| {
-        format!(
-            "Unable to load release target from {:?}: {}",
-            release_dir, err
-        )
-    })?;
+    let release_target = load_release_target(&release_dir)
+        .map_err(|err| format!("Unable to load release target from {release_dir:?}: {err}"))?;
 
     if release_target != crate::build_env::TARGET {
-        return Err(format!("Incompatible update target: {}", release_target));
+        return Err(format!("Incompatible update target: {release_target}"));
     }
 
     // Trigger an update to the modification time for `release_dir`
@@ -1123,13 +1167,17 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         release_dir.join("solana-release"),
         config.active_release_dir(),
     )
-    .map_err(|err| {
-        format!(
+    .map_err(|err| match err.raw_os_error() {
+        #[cfg(windows)]
+        Some(os_err) if os_err == winapi::shared::winerror::ERROR_PRIVILEGE_NOT_HELD as i32 => {
+            "You need to run this command with administrator privileges.".to_string()
+        }
+        _ => format!(
             "Unable to symlink {:?} to {:?}: {}",
             release_dir,
             config.active_release_dir(),
             err
-        )
+        ),
     })?;
 
     config.save(config_file)?;
@@ -1139,13 +1187,13 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         println!(
             "  {}{}",
             SPARKLE,
-            style(format!("{} initialized", updated_version)).bold()
+            style(format!("{updated_version} initialized")).bold()
         );
     } else {
         println!(
             "  {}{}",
             SPARKLE,
-            style(format!("Update successful to {}", updated_version)).bold()
+            style(format!("Update successful to {updated_version}")).bold()
         );
     }
     Ok(true)
@@ -1173,7 +1221,7 @@ pub fn run(
     let mut child_option: Option<std::process::Child> = None;
     let mut now = Instant::now();
 
-    let (signal_sender, signal_receiver) = mpsc::channel();
+    let (signal_sender, signal_receiver) = unbounded();
     ctrlc::set_handler(move || {
         let _ = signal_sender.send(());
     })
@@ -1184,14 +1232,14 @@ pub fn run(
             Some(mut child) => match child.try_wait() {
                 Ok(Some(status)) => {
                     println_name_value(
-                        &format!("{} exited with:", program_name),
+                        &format!("{program_name} exited with:"),
                         &status.to_string(),
                     );
                     None
                 }
                 Ok(None) => Some(child),
                 Err(err) => {
-                    eprintln!("Error attempting to wait for program to exit: {}", err);
+                    eprintln!("Error attempting to wait for program to exit: {err}");
                     None
                 }
             },
@@ -1202,7 +1250,7 @@ pub fn run(
                 {
                     Ok(child) => Some(child),
                     Err(err) => {
-                        eprintln!("Failed to spawn {}: {:?}", program_name, err);
+                        eprintln!("Failed to spawn {program_name}: {err:?}");
                         None
                     }
                 }
@@ -1215,13 +1263,13 @@ pub fn run(
                     // Update successful, kill current process so it will be restart
                     if let Some(ref mut child) = child_option {
                         stop_process(child).unwrap_or_else(|err| {
-                            eprintln!("Failed to stop child: {:?}", err);
+                            eprintln!("Failed to stop child: {err:?}");
                         });
                     }
                 }
                 Ok(false) => {} // No update available
                 Err(err) => {
-                    eprintln!("Failed to apply update: {:?}", err);
+                    eprintln!("Failed to apply update: {err:?}");
                 }
             };
             now = Instant::now();
@@ -1231,10 +1279,42 @@ pub fn run(
             // Handle SIGTERM...
             if let Some(ref mut child) = child_option {
                 stop_process(child).unwrap_or_else(|err| {
-                    eprintln!("Failed to stop child: {:?}", err);
+                    eprintln!("Failed to stop child: {err:?}");
                 });
             }
             std::process::exit(0);
         }
     }
+}
+
+pub fn list(config_file: &str) -> Result<(), String> {
+    let config = Config::load(config_file)?;
+
+    let entries = fs::read_dir(&config.releases_dir).map_err(|err| {
+        format!(
+            "Failed to read install directory, \
+            double check that your configuration file is correct: {err}"
+        )
+    })?;
+
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let dir_name = entry.file_name();
+                let current_version =
+                    load_release_version(&config.active_release_dir().join("version.yml"))?.channel;
+
+                let current = if current_version.contains(dir_name.to_string_lossy().as_ref()) {
+                    " (current)"
+                } else {
+                    ""
+                };
+                println!("{}{}", dir_name.to_string_lossy(), current);
+            }
+            Err(err) => {
+                eprintln!("error listing installed versions: {err:?}");
+            }
+        };
+    }
+    Ok(())
 }

@@ -52,7 +52,7 @@ maintainer to review.
 
 Add only code to the codebase that is ready to be deployed. If you are building
 a large library, consider developing it in a separate git repository. When it
-is ready to be integrated, the Solana maintainers will work with you to decide
+is ready to be integrated, the Solana Labs Maintainers will work with you to decide
 on a path forward. Smaller libraries may be copied in whereas very large ones
 may be pulled in with a package manager.
 
@@ -74,7 +74,7 @@ minutes to execute. Use that time to write a detailed problem description. Once
 the description is written and CI succeeds, click the "Ready to Review" button
 and add reviewers. Adding reviewers before CI succeeds is a fast path to losing
 reviewer engagement. Not only will they be notified and see the PR is not yet
-ready for them, they will also be bombarded them with additional notifications
+ready for them, they will also be bombarded with additional notifications
 each time you push a commit to get past CI or until they "mute" the PR. Once
 muted, you'll need to reach out over some other medium, such as Discord, to
 request they have another look. When you use draft PRs, no notifications are
@@ -146,6 +146,28 @@ the subject lines of the git commits contained in the PR. It's especially
 generous (and not expected) to rebase or reword commits such that each change
 matches the logical flow in your PR description.
 
+### The PR / Issue Labels
+
+Labels make it easier to manage and track PRs / issues.  Below some common labels
+that we use in Solana.  For the complete list of labels, please refer to the
+[label page](https://github.com/solana-labs/solana/issues/labels):
+
+* "feature-gate": when you add a new feature gate or modify the behavior of
+an existing feature gate, please add the "feature-gate" label to your PR.
+New feature gates should also always have a corresponding tracking issue
+(go to "New Issue" -> "Feature Gate Tracker [Get Started](https://github.com/solana-labs/solana/issues/new?assignees=&labels=feature-gate&template=1-feature-gate.yml&title=Feature+Gate%3A+)")
+and should be updated each time the feature is activated on a cluster.
+
+* "automerge": When a PR is labelled with "automerge", the PR will be
+automatically merged once CI passes.  In general, this label should only
+be used for small hot-fix (fewer than 100 lines) or automatic generated
+PRs.  If you're uncertain, it's usually the case that the PR is not
+qualified as "automerge".
+
+* "good first issue": If you happen to find an issue that is non-urgent and
+self-contained with moderate scope, you might want to consider attaching
+"good first issue" to it as it might be a good practice for newcomers.
+
 ### When will my PR be reviewed?
 
 PRs are typically reviewed and merged in under 7 days. If your PR has been open
@@ -173,6 +195,38 @@ a commit.  After a reviewer adds feedback, they won't be checking on the status
 of that feedback after every new commit. Instead, directly mention the reviewer
 when you feel your PR is ready for another pass.
 
+### Is your PR easy to say "yes" to?
+
+PRs that are easier to review are more likely to be reviewed. Strive to make
+your PR easy to say "yes" to.
+
+Non-exhaustive list of things that make it *harder* to review:
+
+* Additional changes that are orthogonal to the problem statement and proposed
+  changes. Instead move those changes to a different PR.
+* Renaming variables/functions/types unnecessarily and/or without explanation.
+* Not following established conventions in the function/module/crate/repo.
+* Changing whitespace: moving code and/or reformatting code. Make such changes
+  in a separate PR.
+* Force-pushing the branch unnecessarily; this makes it harder to track any
+  previous comments on specific lines of code, and also harder to track changes
+  already reviewed from previous commits.
+  * When force-pushing is required—for example to handle a merge conflict—and
+    no new changes have been made since the previous review, indicating as such
+    is beneficial.
+ * Not responding to comments from previous rounds of review. Follow the
+   guidance in [How to manage review feedback?](#how-to-manage-review-feedback).
+
+Non-exhaustive list of things that make it *easier* to review:
+
+* Adding tests for all new/changed behavior.
+* Including in the PR's description any non-automated testing that was
+  performed.
+* Including relevant results for changes that target performance improvements.
+
+Note that these lists are *independent* of how simple/complicated the actual
+*code* changes are.
+
 ## Draft Pull Requests
 
 If you want early feedback on your PR, use GitHub's "Draft Pull Request"
@@ -187,6 +241,41 @@ of the direction" suddenly has the appearance of "I approve of these changes."
 Instead, add a comment that mentions the usernames that you would like a review
 from. Ask explicitly what you would like feedback on.
 
+## Crate Creation
+
+If your PR includes a new crate, you must publish its v0.0.1 version
+before the PR can be merged.  Here are the steps:
+
+* Create a sub-directory for your new crate.
+* Under the newly-created directory, create a Cargo.toml file.  Below is an
+  example template:
+
+```toml
+[package]
+name = "solana-<PACKAGE_NAME>"
+version = "0.0.1"
+description = "<DESCRIPTION>"
+authors = ["Solana Labs Maintainers <maintainers@solanalabs.com>"]
+repository = "https://github.com/solana-labs/solana"
+homepage = "https://solana.com/"
+documentation = "https://docs.rs/solana-<PACKAGE_NAME>"
+license = "Apache-2.0"
+edition = "2021"
+```
+
+* Submit the PR for initial review.  You should see the crate-check CI
+  job fails because the newly created crate is not yet published.
+
+* Once all review feedback has been addressed, publish v0.0.1 of the crate
+  under your personal crates.io account, and then transfer the crate ownership
+  to solana-grimes.
+  https://crates.io/policies#package-ownership
+
+* After successful publication, update the PR by replacing the v0.0.1 version
+  number with the correct version.  At this time you should see the crate-check
+  CI job passes, and your published crate should be available under
+  https://crates.io/crates/.
+
 ## Rust coding conventions
 
 * All Rust code is formatted using the latest version of `rustfmt`. Once
@@ -196,7 +285,9 @@ from. Ask explicitly what you would like feedback on.
 * All Rust code is linted with Clippy. If you'd prefer to ignore its advice, do
   so explicitly:
 
-  ```rust #[allow(clippy::too_many_arguments)] ```
+  ```rust
+  #[allow(clippy::too_many_arguments)]
+  ```
 
   Note: Clippy defaults can be overridden in the top-level file `.clippy.toml`.
 
@@ -224,25 +315,17 @@ Inventing new terms is allowed, but should only be done when the term is widely
 used and understood. Avoid introducing new 3-letter terms, which can be
 confused with 3-letter acronyms.
 
-[Terms currently in use](docs/src/terminology.md)
+[Terms currently in use](https://solana.com/docs/terminology)
 
 
 ## Design Proposals
 
-Solana's architecture is described by docs generated from markdown files in
-the `docs/src/` directory, maintained by an *editor* (currently @garious). To
-add a design proposal, you'll need to include it in the
-[Accepted Design Proposals](https://docs.solana.com/proposals/accepted-design-proposals)
-section of the Solana docs.  Here's the full process:
+This Solana validator client's architecture is described by docs generated from markdown files in the `docs/src/`
+directory and viewable on the official [Solana Labs Validator Client](https://docs.solanalabs.com) documentation website.
 
-1. Propose a design by creating a PR that adds a markdown document to the
-   `docs/src/proposals` directory and references it from the [table of
-   contents](docs/src/SUMMARY.md). Add any relevant *maintainers* to the PR
-   review.
-2. The PR being merged indicates your proposed change was accepted and that the
-   maintainers support your plan of attack.
-3. Submit PRs that implement the proposal. When the implementation reveals the
-   need for tweaks to the proposal, be sure to update the proposal and have that
-   change reviewed by the same people as in step 1.
-4. Once the implementation is complete, submit a PR that moves the link from
-   the Accepted Proposals to the Implemented Proposals section.
+Current design proposals may be viewed on the docs site:
+
+1. [Accepted Proposals](https://docs.solanalabs.com/proposals/accepted-design-proposals)
+2. [Implemented Proposals](https://docs.solanalabs.com/implemented-proposals/implemented-proposals)
+
+New design proposals should follow this guide on [how to submit a design proposal](./docs/src/proposals.md#submit-a-design-proposal).

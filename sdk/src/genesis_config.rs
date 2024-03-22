@@ -1,35 +1,36 @@
-//! The `genesis_config` module is a library for generating the chain's genesis config.
+//! The chain's genesis config.
 
 #![cfg(feature = "full")]
 
-use crate::{
-    account::Account,
-    account::AccountSharedData,
-    clock::{UnixTimestamp, DEFAULT_TICKS_PER_SLOT},
-    epoch_schedule::EpochSchedule,
-    fee_calculator::FeeRateGovernor,
-    hash::{hash, Hash},
-    inflation::Inflation,
-    native_token::lamports_to_sol,
-    poh_config::PohConfig,
-    pubkey::Pubkey,
-    rent::Rent,
-    shred_version::compute_shred_version,
-    signature::{Keypair, Signer},
-    system_program,
-    timing::years_as_slots,
-};
-use bincode::{deserialize, serialize};
-use chrono::{TimeZone, Utc};
-use memmap2::Mmap;
-use std::{
-    collections::BTreeMap,
-    fmt,
-    fs::{File, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-    str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
+use {
+    crate::{
+        account::{Account, AccountSharedData},
+        clock::{UnixTimestamp, DEFAULT_TICKS_PER_SLOT},
+        epoch_schedule::EpochSchedule,
+        fee_calculator::FeeRateGovernor,
+        hash::{hash, Hash},
+        inflation::Inflation,
+        native_token::lamports_to_sol,
+        poh_config::PohConfig,
+        pubkey::Pubkey,
+        rent::Rent,
+        shred_version::compute_shred_version,
+        signature::{Keypair, Signer},
+        system_program,
+        timing::years_as_slots,
+    },
+    bincode::{deserialize, serialize},
+    chrono::{TimeZone, Utc},
+    memmap2::Mmap,
+    std::{
+        collections::BTreeMap,
+        fmt,
+        fs::{File, OpenOptions},
+        io::Write,
+        path::{Path, PathBuf},
+        str::FromStr,
+        time::{SystemTime, UNIX_EPOCH},
+    },
 };
 
 pub const DEFAULT_GENESIS_FILE: &str = "genesis.bin";
@@ -40,7 +41,7 @@ pub const DEFAULT_GENESIS_DOWNLOAD_PATH: &str = "/genesis.tar.bz2";
 pub const UNUSED_DEFAULT: u64 = 1024;
 
 // The order can't align with release lifecycle only to remain ABI-compatible...
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, AbiEnumVisitor, AbiExample)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, AbiEnumVisitor, AbiExample)]
 pub enum ClusterType {
     Testnet,
     MainnetBeta,
@@ -50,6 +51,22 @@ pub enum ClusterType {
 
 impl ClusterType {
     pub const STRINGS: [&'static str; 4] = ["development", "devnet", "testnet", "mainnet-beta"];
+
+    /// Get the known genesis hash for this ClusterType
+    pub fn get_genesis_hash(&self) -> Option<Hash> {
+        match self {
+            Self::MainnetBeta => {
+                Some(Hash::from_str("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d").unwrap())
+            }
+            Self::Testnet => {
+                Some(Hash::from_str("4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY").unwrap())
+            }
+            Self::Devnet => {
+                Some(Hash::from_str("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG").unwrap())
+            }
+            Self::Development => None,
+        }
+    }
 }
 
 impl FromStr for ClusterType {
@@ -61,13 +78,13 @@ impl FromStr for ClusterType {
             "devnet" => Ok(ClusterType::Devnet),
             "testnet" => Ok(ClusterType::Testnet),
             "mainnet-beta" => Ok(ClusterType::MainnetBeta),
-            _ => Err(format!("{} is unrecognized for cluster type", s)),
+            _ => Err(format!("{s} is unrecognized for cluster type")),
         }
     }
 }
 
 #[frozen_abi(digest = "3V3ZVRyzNhRfe8RJwDeGpeTP8xBWGGFBEbwTkvKKVjEa")]
-#[derive(Serialize, Deserialize, Debug, Clone, AbiExample)]
+#[derive(Serialize, Deserialize, Debug, Clone, AbiExample, PartialEq)]
 pub struct GenesisConfig {
     /// when the network (bootstrap validator) was started relative to the UNIX Epoch
     pub creation_time: UnixTimestamp,
@@ -167,7 +184,7 @@ impl GenesisConfig {
             .map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Unable to open {:?}: {:?}", filename, err),
+                    format!("Unable to open {filename:?}: {err:?}"),
                 )
             })?;
 
@@ -175,14 +192,14 @@ impl GenesisConfig {
         let mem = unsafe { Mmap::map(&file) }.map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Unable to map {:?}: {:?}", filename, err),
+                format!("Unable to map {filename:?}: {err:?}"),
             )
         })?;
 
         let genesis_config = deserialize(&mem).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Unable to deserialize {:?}: {:?}", filename, err),
+                format!("Unable to deserialize {filename:?}: {err:?}"),
             )
         })?;
         Ok(genesis_config)
@@ -192,11 +209,11 @@ impl GenesisConfig {
         let serialized = serialize(&self).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Unable to serialize: {:?}", err),
+                format!("Unable to serialize: {err:?}"),
             )
         })?;
 
-        std::fs::create_dir_all(&ledger_path)?;
+        std::fs::create_dir_all(ledger_path)?;
 
         let mut file = File::create(Self::genesis_filename(ledger_path))?;
         file.write_all(&serialized)
@@ -256,7 +273,9 @@ impl fmt::Display for GenesisConfig {
              Native instruction processors: {:#?}\n\
              Rewards pool: {:#?}\n\
              ",
-            Utc.timestamp(self.creation_time, 0).to_rfc3339(),
+            Utc.timestamp_opt(self.creation_time, 0)
+                .unwrap()
+                .to_rfc3339(),
             self.cluster_type,
             self.hash(),
             compute_shred_version(&self.hash(), None),
@@ -291,9 +310,11 @@ impl fmt::Display for GenesisConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::signature::{Keypair, Signer};
-    use std::path::PathBuf;
+    use {
+        super::*,
+        crate::signature::{Keypair, Signer},
+        std::path::PathBuf,
+    };
 
     fn make_tmp_path(name: &str) -> PathBuf {
         let out_dir = std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string());
@@ -340,6 +361,6 @@ mod tests {
         config.write(path).expect("write");
         let loaded_config = GenesisConfig::load(path).expect("load");
         assert_eq!(config.hash(), loaded_config.hash());
-        let _ignored = std::fs::remove_file(&path);
+        let _ignored = std::fs::remove_file(path);
     }
 }

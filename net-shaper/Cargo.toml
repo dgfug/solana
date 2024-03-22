@@ -1,21 +1,20 @@
 [package]
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-edition = "2018"
 name = "solana-net-shaper"
 description = "The solana cluster network shaping tool"
-version = "1.9.0"
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-clap = "2.33.1"
-serde = "1.0.130"
-serde_json = "1.0.68"
-solana-clap-utils = { path = "../clap-utils", version = "=1.9.0" }
-solana-logger = { path = "../logger", version = "=1.9.0" }
-rand = "0.7.0"
+clap = { version = "3.1.5", features = ["cargo"] }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+solana-logger = { workspace = true }
 
 [[bin]]
 name = "solana-net-shaper"

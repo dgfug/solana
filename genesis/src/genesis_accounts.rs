@@ -1,8 +1,13 @@
-use crate::{
-    stakes::{create_and_add_stakes, StakerInfo},
-    unlocks::UnlockInfo,
+use {
+    crate::{
+        stakes::{create_and_add_stakes, StakerInfo},
+        unlocks::UnlockInfo,
+    },
+    solana_sdk::{
+        genesis_config::{ClusterType, GenesisConfig},
+        native_token::LAMPORTS_PER_SOL,
+    },
 };
-use solana_sdk::{genesis_config::GenesisConfig, native_token::LAMPORTS_PER_SOL};
 
 // 9 month schedule is 100% after 9 months
 const UNLOCKS_ALL_AT_9_MONTHS: UnlockInfo = UnlockInfo {
@@ -225,10 +230,14 @@ fn add_stakes(
         .sum::<u64>()
 }
 
+/// Add acounts that should be present in genesis; skip for development clusters
 pub fn add_genesis_accounts(genesis_config: &mut GenesisConfig, mut issued_lamports: u64) {
+    if genesis_config.cluster_type == ClusterType::Development {
+        return;
+    }
+
     // add_stakes() and add_validators() award tokens for rent exemption and
     //  to cover an initial transfer-free period of the network
-
     issued_lamports += add_stakes(
         genesis_config,
         CREATOR_STAKER_INFOS,
@@ -268,16 +277,26 @@ mod tests {
 
     #[test]
     fn test_add_genesis_accounts() {
-        let mut genesis_config = GenesisConfig::default();
+        let clusters_and_expected_lamports = [
+            (ClusterType::MainnetBeta, 500_000_000 * LAMPORTS_PER_SOL),
+            (ClusterType::Testnet, 500_000_000 * LAMPORTS_PER_SOL),
+            (ClusterType::Devnet, 500_000_000 * LAMPORTS_PER_SOL),
+            (ClusterType::Development, 0),
+        ];
 
-        add_genesis_accounts(&mut genesis_config, 0);
+        for (cluster_type, expected_lamports) in clusters_and_expected_lamports.iter() {
+            let mut genesis_config = GenesisConfig {
+                cluster_type: *cluster_type,
+                ..GenesisConfig::default()
+            };
+            add_genesis_accounts(&mut genesis_config, 0);
 
-        let lamports = genesis_config
-            .accounts
-            .iter()
-            .map(|(_, account)| account.lamports)
-            .sum::<u64>();
-
-        assert_eq!(500_000_000 * LAMPORTS_PER_SOL, lamports);
+            let lamports = genesis_config
+                .accounts
+                .values()
+                .map(|account| account.lamports)
+                .sum::<u64>();
+            assert_eq!(*expected_lamports, lamports);
+        }
     }
 }

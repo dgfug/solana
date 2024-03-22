@@ -1,18 +1,20 @@
-use core::ffi::c_void;
-use dlopen::symbor::{Container, SymBorApi, Symbol};
-use dlopen_derive::SymBorApi;
-use log::*;
-use solana_sdk::packet::Packet;
-use std::env;
-use std::ffi::OsStr;
-use std::fs;
-use std::os::raw::{c_int, c_uint};
-use std::path::{Path, PathBuf};
-use std::sync::Once;
+use {
+    core::ffi::c_void,
+    dlopen2::symbor::{Container, SymBorApi, Symbol},
+    log::*,
+    std::{
+        env,
+        ffi::OsStr,
+        fs,
+        os::raw::{c_int, c_uint},
+        path::{Path, PathBuf},
+        sync::Once,
+    },
+};
 
 #[repr(C)]
 pub struct Elems {
-    pub elems: *const Packet,
+    pub elems: *const u8,
     pub num: u32,
 }
 
@@ -117,7 +119,7 @@ fn find_cuda_home(perf_libs_path: &Path) -> Option<PathBuf> {
     }
 
     // Search /usr/local for a `cuda-` directory that matches a perf-libs subdirectory
-    for entry in fs::read_dir(&perf_libs_path).unwrap().flatten() {
+    for entry in fs::read_dir(perf_libs_path).unwrap().flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -138,9 +140,11 @@ fn find_cuda_home(perf_libs_path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn append_to_ld_library_path(path: String) {
-    let ld_library_path =
-        path + ":" + &env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "".to_string());
+pub fn append_to_ld_library_path(mut ld_library_path: String) {
+    if let Ok(env_value) = env::var("LD_LIBRARY_PATH") {
+        ld_library_path.push(':');
+        ld_library_path.push_str(&env_value);
+    }
     info!("setting ld_library_path to: {:?}", ld_library_path);
     env::set_var("LD_LIBRARY_PATH", ld_library_path);
 }

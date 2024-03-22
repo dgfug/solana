@@ -73,6 +73,11 @@ To know the digest for new ABI items, developers can add `frozen_abi` with a
 random digest value and run the unit tests and replace it with the correct
 digest from the assertion test error message.
 
+Run unit tests using the following command to generate digest values:
+```
+SOLANA_ABI_DUMP_DIR=. cargo +nightly test abi
+```
+
 In general, once we add `frozen_abi` and its change is published in the stable
 release channel, its digest should never change. If such a change is needed, we
 should opt for defining a new `struct` like `FooV1`. And special release flow
@@ -125,7 +130,7 @@ name suggests, there is no need to implement `AbiEnumVisitor` for other types.
 To summarize this interplay, `serde` handles the recursive serialization control
 flow in tandem with `AbiDigester`. The initial entry point in tests and child
 `AbiDigester`s use `AbiExample` recursively to create an example object
-hierarchal graph. And `AbiDigester` uses `AbiEnumVisitor` to inquiry the actual
+hierarchical graph. And `AbiDigester` uses `AbiEnumVisitor` to inquiry the actual
 ABI information using the constructed sample.
 
 `Default` isn't enough for `AbiExample`. Various collection's `::default()` is
@@ -137,7 +142,7 @@ On the other hand, ABI digesting can't be done only with `AbiExample`, either.
 `AbiEnumVisitor` is required because all variants of an `enum` cannot be
 traversed just with a single variant of it as a ABI example.
 
-Digestable information:
+Digestible information:
 
 - rust's type name
 - `serde`'s data type name
@@ -147,7 +152,7 @@ Digestable information:
 - `enum`: normal variants and `struct`- and `tuple`- styles.
 - attributes: `serde(serialize_with=...)` and `serde(skip)`
 
-Not digestable information:
+Not digestible information:
 
 - Any custom serialize code path not touched by the sample provided by
   `AbiExample`. (technically not possible)

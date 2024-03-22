@@ -1,41 +1,51 @@
 //! A command-line executable for generating the chain's genesis config.
-#![allow(clippy::integer_arithmetic)]
+#![allow(clippy::arithmetic_side_effects)]
 
-use clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg, ArgMatches};
-use solana_clap_utils::{
-    input_parsers::{cluster_type_of, pubkey_of, pubkeys_of, unix_timestamp_from_rfc3339_datetime},
-    input_validators::{is_pubkey_or_keypair, is_rfc3339_datetime, is_slot, is_valid_percentage},
-};
-use solana_entry::poh::compute_hashes_per_tick;
-use solana_genesis::{genesis_accounts::add_genesis_accounts, Base64Account};
-use solana_ledger::{blockstore::create_new_ledger, blockstore_db::AccessType};
-use solana_runtime::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE;
-use solana_sdk::{
-    account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
-    clock,
-    epoch_schedule::EpochSchedule,
-    fee_calculator::FeeRateGovernor,
-    genesis_config::{ClusterType, GenesisConfig},
-    inflation::Inflation,
-    native_token::sol_to_lamports,
-    poh_config::PohConfig,
-    pubkey::Pubkey,
-    rent::Rent,
-    signature::{Keypair, Signer},
-    stake::state::StakeState,
-    system_program, timing,
-};
-use solana_stake_program::stake_state;
-use solana_vote_program::vote_state::{self, VoteState};
-use std::{
-    collections::HashMap,
-    error,
-    fs::File,
-    io::{self, Read},
-    path::PathBuf,
-    process,
-    str::FromStr,
-    time::Duration,
+use {
+    base64::{prelude::BASE64_STANDARD, Engine},
+    clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg, ArgMatches},
+    itertools::Itertools,
+    solana_accounts_db::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+    solana_clap_utils::{
+        input_parsers::{
+            cluster_type_of, pubkey_of, pubkeys_of, unix_timestamp_from_rfc3339_datetime,
+        },
+        input_validators::{
+            is_pubkey_or_keypair, is_rfc3339_datetime, is_slot, is_valid_percentage,
+        },
+    },
+    solana_entry::poh::compute_hashes_per_tick,
+    solana_genesis::{genesis_accounts::add_genesis_accounts, Base64Account},
+    solana_ledger::{blockstore::create_new_ledger, blockstore_options::LedgerColumnOptions},
+    solana_sdk::{
+        account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
+        bpf_loader_upgradeable::UpgradeableLoaderState,
+        clock,
+        epoch_schedule::EpochSchedule,
+        fee_calculator::FeeRateGovernor,
+        genesis_config::{ClusterType, GenesisConfig},
+        inflation::Inflation,
+        native_token::sol_to_lamports,
+        poh_config::PohConfig,
+        pubkey::Pubkey,
+        rent::Rent,
+        signature::{Keypair, Signer},
+        signer::keypair::read_keypair_file,
+        stake::state::StakeStateV2,
+        system_program, timing,
+    },
+    solana_stake_program::stake_state,
+    solana_vote_program::vote_state::{self, VoteState},
+    std::{
+        collections::HashMap,
+        error,
+        fs::File,
+        io::{self, Read},
+        path::PathBuf,
+        process,
+        str::FromStr,
+        time::Duration,
+    },
 };
 
 pub enum AccountFileFormat {
@@ -54,17 +64,17 @@ fn pubkey_from_str(key_str: &str) -> Result<Pubkey, Box<dyn error::Error>> {
 
 pub fn load_genesis_accounts(file: &str, genesis_config: &mut GenesisConfig) -> io::Result<u64> {
     let mut lamports = 0;
-    let accounts_file = File::open(file.to_string())?;
+    let accounts_file = File::open(file)?;
 
     let genesis_accounts: HashMap<String, Base64Account> =
         serde_yaml::from_reader(accounts_file)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{:?}", err)))?;
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("{err:?}")))?;
 
     for (key, account_details) in genesis_accounts {
         let pubkey = pubkey_from_str(key.as_str()).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
-                format!("Invalid pubkey/keypair {}: {:?}", key, err),
+                format!("Invalid pubkey/keypair {key}: {err:?}"),
             )
         })?;
 
@@ -77,13 +87,15 @@ pub fn load_genesis_accounts(file: &str, genesis_config: &mut GenesisConfig) -> 
 
         let mut account = AccountSharedData::new(account_details.balance, 0, &owner_program_id);
         if account_details.data != "~" {
-            account.set_data(
-                base64::decode(account_details.data.as_str()).map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Invalid account data: {}: {:?}", account_details.data, err),
-                    )
-                })?,
+            account.set_data_from_slice(
+                &BASE64_STANDARD
+                    .decode(account_details.data.as_str())
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Invalid account data: {}: {:?}", account_details.data, err),
+                        )
+                    })?,
             );
         }
         account.set_executable(account_details.executable);
@@ -129,7 +141,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         .to_string();
     // stake account
     let default_bootstrap_validator_stake_lamports = &sol_to_lamports(0.5)
-        .max(StakeState::get_rent_exempt_reserve(&rent))
+        .max(rent.minimum_balance(StakeStateV2::size_of()))
         .to_string();
 
     let default_target_tick_duration =
@@ -364,11 +376,20 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         .arg(
             Arg::with_name("bpf_program")
                 .long("bpf-program")
-                .value_name("ADDRESS BPF_PROGRAM.SO")
+                .value_name("ADDRESS LOADER SBF_PROGRAM.SO")
                 .takes_value(true)
                 .number_of_values(3)
                 .multiple(true)
-                .help("Install a BPF program at the given address"),
+                .help("Install a SBF program at the given address"),
+        )
+        .arg(
+            Arg::with_name("upgradeable_program")
+                .long("upgradeable-program")
+                .value_name("ADDRESS UPGRADEABLE_LOADER SBF_PROGRAM.SO UPGRADE_AUTHORITY")
+                .takes_value(true)
+                .number_of_values(4)
+                .multiple(true)
+                .help("Install an upgradeable SBF program at the given address with the given upgrade authority (or \"none\")"),
         )
         .arg(
             Arg::with_name("inflation")
@@ -395,8 +416,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "error: insufficient {}: {} for rent exemption, requires {}",
-                    name, lamports, exempt
+                    "error: insufficient {name}: {lamports} for rent exemption, requires {exempt}"
                 ),
             ))
         } else {
@@ -424,7 +444,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let bootstrap_validator_stake_lamports = rent_exempt_check(
         &matches,
         "bootstrap_validator_stake_lamports",
-        StakeState::get_rent_exempt_reserve(&rent),
+        rent.minimum_balance(StakeStateV2::size_of()),
     )?;
 
     let bootstrap_stake_authorized_pubkey =
@@ -511,9 +531,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     let mut bootstrap_validator_pubkeys_iter = bootstrap_validator_pubkeys.iter();
     loop {
-        let identity_pubkey = match bootstrap_validator_pubkeys_iter.next() {
-            None => break,
-            Some(identity_pubkey) => identity_pubkey,
+        let Some(identity_pubkey) = bootstrap_validator_pubkeys_iter.next() else {
+            break;
         };
         let vote_pubkey = bootstrap_validator_pubkeys_iter.next().unwrap();
         let stake_pubkey = bootstrap_validator_pubkeys_iter.next().unwrap();
@@ -528,7 +547,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             identity_pubkey,
             identity_pubkey,
             commission,
-            VoteState::get_rent_exempt_reserve(&rent).max(1),
+            VoteState::get_rent_exempt_reserve(&genesis_config.rent).max(1),
         );
 
         genesis_config.add_account(
@@ -539,7 +558,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                     .unwrap_or(identity_pubkey),
                 vote_pubkey,
                 &vote_account,
-                &rent,
+                &genesis_config.rent,
                 bootstrap_validator_stake_lamports,
             ),
         );
@@ -574,47 +593,101 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     let issued_lamports = genesis_config
         .accounts
-        .iter()
-        .map(|(_key, account)| account.lamports)
+        .values()
+        .map(|account| account.lamports)
         .sum::<u64>();
 
     add_genesis_accounts(&mut genesis_config, issued_lamports - faucet_lamports);
 
+    let parse_address = |address: &str, input_type: &str| {
+        address.parse::<Pubkey>().unwrap_or_else(|err| {
+            eprintln!("Error: invalid {input_type} {address}: {err}");
+            process::exit(1);
+        })
+    };
+
+    let parse_program_data = |program: &str| {
+        let mut program_data = vec![];
+        File::open(program)
+            .and_then(|mut file| file.read_to_end(&mut program_data))
+            .unwrap_or_else(|err| {
+                eprintln!("Error: failed to read {program}: {err}");
+                process::exit(1);
+            });
+        program_data
+    };
+
     if let Some(values) = matches.values_of("bpf_program") {
-        let values: Vec<&str> = values.collect::<Vec<_>>();
-        for address_loader_program in values.chunks(3) {
-            match address_loader_program {
-                [address, loader, program] => {
-                    let address = address.parse::<Pubkey>().unwrap_or_else(|err| {
-                        eprintln!("Error: invalid address {}: {}", address, err);
-                        process::exit(1);
-                    });
+        for (address, loader, program) in values.tuples() {
+            let address = parse_address(address, "address");
+            let loader = parse_address(loader, "loader");
+            let program_data = parse_program_data(program);
+            genesis_config.add_account(
+                address,
+                AccountSharedData::from(Account {
+                    lamports: genesis_config.rent.minimum_balance(program_data.len()),
+                    data: program_data,
+                    executable: true,
+                    owner: loader,
+                    rent_epoch: 0,
+                }),
+            );
+        }
+    }
 
-                    let loader = loader.parse::<Pubkey>().unwrap_or_else(|err| {
-                        eprintln!("Error: invalid loader {}: {}", loader, err);
-                        process::exit(1);
-                    });
-
-                    let mut program_data = vec![];
-                    File::open(program)
-                        .and_then(|mut file| file.read_to_end(&mut program_data))
+    if let Some(values) = matches.values_of("upgradeable_program") {
+        for (address, loader, program, upgrade_authority) in values.tuples() {
+            let address = parse_address(address, "address");
+            let loader = parse_address(loader, "loader");
+            let program_data_elf = parse_program_data(program);
+            let upgrade_authority_address = if upgrade_authority == "none" {
+                Pubkey::default()
+            } else {
+                upgrade_authority.parse::<Pubkey>().unwrap_or_else(|_| {
+                    read_keypair_file(upgrade_authority)
+                        .map(|keypair| keypair.pubkey())
                         .unwrap_or_else(|err| {
-                            eprintln!("Error: failed to read {}: {}", program, err);
+                            eprintln!(
+                                "Error: invalid upgrade_authority {upgrade_authority}: {err}"
+                            );
                             process::exit(1);
-                        });
-                    genesis_config.add_account(
-                        address,
-                        AccountSharedData::from(Account {
-                            lamports: genesis_config.rent.minimum_balance(program_data.len()),
-                            data: program_data,
-                            executable: true,
-                            owner: loader,
-                            rent_epoch: 0,
-                        }),
-                    );
-                }
-                _ => unreachable!(),
-            }
+                        })
+                })
+            };
+
+            let (programdata_address, _) =
+                Pubkey::find_program_address(&[address.as_ref()], &loader);
+            let mut program_data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+                slot: 0,
+                upgrade_authority_address: Some(upgrade_authority_address),
+            })
+            .unwrap();
+            program_data.extend_from_slice(&program_data_elf);
+            genesis_config.add_account(
+                programdata_address,
+                AccountSharedData::from(Account {
+                    lamports: genesis_config.rent.minimum_balance(program_data.len()),
+                    data: program_data,
+                    owner: loader,
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+            );
+
+            let program_data = bincode::serialize(&UpgradeableLoaderState::Program {
+                programdata_address,
+            })
+            .unwrap();
+            genesis_config.add_account(
+                address,
+                AccountSharedData::from(Account {
+                    lamports: genesis_config.rent.minimum_balance(program_data.len()),
+                    data: program_data,
+                    owner: loader,
+                    executable: true,
+                    rent_epoch: 0,
+                }),
+            );
         }
     }
 
@@ -623,21 +696,20 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         &ledger_path,
         &genesis_config,
         max_genesis_archive_unpacked_size,
-        AccessType::PrimaryOnly,
+        LedgerColumnOptions::default(),
     )?;
 
-    println!("{}", genesis_config);
+    println!("{genesis_config}");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use solana_sdk::genesis_config::GenesisConfig;
-    use std::collections::HashMap;
-    use std::fs::remove_file;
-    use std::io::Write;
-    use std::path::Path;
+    use {
+        super::*,
+        solana_sdk::genesis_config::GenesisConfig,
+        std::{collections::HashMap, fs::remove_file, io::Write, path::Path},
+    };
 
     #[test]
     fn test_append_primordial_accounts_to_genesis() {
@@ -678,6 +750,7 @@ mod tests {
         let serialized = serde_yaml::to_string(&genesis_accounts).unwrap();
         let path = Path::new("test_append_primordial_accounts_to_genesis.yml");
         let mut file = File::create(path).unwrap();
+        file.write_all(b"---\n").unwrap();
         file.write_all(&serialized.into_bytes()).unwrap();
 
         load_genesis_accounts(
@@ -713,7 +786,7 @@ mod tests {
 
                 assert_eq!(
                     b64_account.data,
-                    base64::encode(&genesis_config.accounts[&pubkey].data)
+                    BASE64_STANDARD.encode(&genesis_config.accounts[&pubkey].data)
                 );
             }
         }
@@ -751,6 +824,7 @@ mod tests {
         let serialized = serde_yaml::to_string(&genesis_accounts1).unwrap();
         let path = Path::new("test_append_primordial_accounts_to_genesis.yml");
         let mut file = File::create(path).unwrap();
+        file.write_all(b"---\n").unwrap();
         file.write_all(&serialized.into_bytes()).unwrap();
 
         load_genesis_accounts(
@@ -796,7 +870,7 @@ mod tests {
 
             assert_eq!(
                 b64_account.data,
-                base64::encode(&genesis_config.accounts[&pubkey].data),
+                BASE64_STANDARD.encode(&genesis_config.accounts[&pubkey].data),
             );
         }
 
@@ -834,6 +908,7 @@ mod tests {
         let serialized = serde_yaml::to_string(&genesis_accounts2).unwrap();
         let path = Path::new("test_append_primordial_accounts_to_genesis.yml");
         let mut file = File::create(path).unwrap();
+        file.write_all(b"---\n").unwrap();
         file.write_all(&serialized.into_bytes()).unwrap();
 
         load_genesis_accounts(
@@ -879,7 +954,7 @@ mod tests {
 
             assert_eq!(
                 b64_account.data,
-                base64::encode(&genesis_config.accounts[&pubkey].data),
+                BASE64_STANDARD.encode(&genesis_config.accounts[&pubkey].data),
             );
         }
 
@@ -904,7 +979,7 @@ mod tests {
 
             assert_eq!(
                 genesis_accounts2[&keypair_str].data,
-                base64::encode(&genesis_config.accounts[&pubkey].data),
+                BASE64_STANDARD.encode(&genesis_config.accounts[&pubkey].data),
             );
         });
     }

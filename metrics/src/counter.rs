@@ -32,7 +32,6 @@ pub struct CounterPoint {
 }
 
 impl CounterPoint {
-    #[cfg(test)]
     pub fn new(name: &'static str) -> Self {
         CounterPoint {
             name,
@@ -59,11 +58,7 @@ macro_rules! create_counter {
 #[macro_export]
 macro_rules! inc_counter {
     ($name:expr, $level:expr, $count:expr) => {
-        unsafe {
-            if log_enabled!($level) {
-                $name.inc($level, $count)
-            }
-        };
+        unsafe { $name.inc($level, $count) };
     };
 }
 
@@ -211,13 +206,15 @@ impl Counter {
 }
 #[cfg(test)]
 mod tests {
-    use crate::counter::{Counter, DEFAULT_LOG_RATE, DEFAULT_METRICS_RATE};
-    use log::Level;
-    use log::*;
-    use serial_test::serial;
-    use std::env;
-    use std::sync::atomic::Ordering;
-    use std::sync::{Once, RwLock};
+    use {
+        crate::counter::{Counter, DEFAULT_LOG_RATE, DEFAULT_METRICS_RATE},
+        log::{Level, *},
+        serial_test::serial,
+        std::{
+            env,
+            sync::{atomic::Ordering, Once, RwLock},
+        },
+    };
 
     fn get_env_lock() -> &'static RwLock<()> {
         static mut ENV_LOCK: Option<RwLock<()>> = None;

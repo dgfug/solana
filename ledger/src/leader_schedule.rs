@@ -1,21 +1,19 @@
-use itertools::Itertools;
-use rand::distributions::{Distribution, WeightedIndex};
-use rand_chacha::{rand_core::SeedableRng, ChaChaRng};
-use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
-use std::convert::identity;
-use std::ops::Index;
-use std::sync::Arc;
+use {
+    itertools::Itertools,
+    rand::distributions::{Distribution, WeightedIndex},
+    rand_chacha::{rand_core::SeedableRng, ChaChaRng},
+    solana_sdk::pubkey::Pubkey,
+    std::{collections::HashMap, convert::identity, ops::Index, sync::Arc},
+};
 
 // Used for testing
 #[derive(Clone, Debug)]
 pub struct FixedSchedule {
     pub leader_schedule: Arc<LeaderSchedule>,
-    pub start_epoch: u64,
 }
 
 /// Stake-weighted leader schedule for one epoch.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct LeaderSchedule {
     slot_leaders: Vec<Pubkey>,
     // Inverted index from pubkeys to indices where they are the leader.
@@ -101,9 +99,7 @@ impl Index<u64> for LeaderSchedule {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rand::Rng;
-    use std::iter::repeat_with;
+    use {super::*, rand::Rng, std::iter::repeat_with};
 
     #[test]
     fn test_leader_schedule_index() {
@@ -204,7 +200,7 @@ mod tests {
         const NUM_SLOTS: usize = 97;
         let mut rng = rand::thread_rng();
         let pubkeys: Vec<_> = repeat_with(Pubkey::new_unique).take(4).collect();
-        let schedule: Vec<_> = repeat_with(|| pubkeys[rng.gen_range(0, 3)])
+        let schedule: Vec<_> = repeat_with(|| pubkeys[rng.gen_range(0..3)])
             .take(19)
             .collect();
         let schedule = LeaderSchedule::new_from_schedule(schedule);

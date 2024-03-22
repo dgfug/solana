@@ -10,7 +10,7 @@ if ! command -v grcov; then
   exit 1
 fi
 
-if [[ ! "$(grcov --version)" =~ 0.[678].[012] ]]; then
+if [[ ! "$(grcov --version)" =~ 0.8.[0-9] ]]; then
   echo Error: Required grcov version not installed
 
   echo "Installed version: $(grcov --version)"
@@ -34,7 +34,7 @@ fi
 
 coverageFlags=()
 coverageFlags+=(-Zprofile)               # Enable coverage
-coverageFlags+=("-Aincomplete_features") # Supress warnings due to frozen abi, which is harmless for it
+coverageFlags+=("-Aincomplete_features") # Suppress warnings due to frozen abi, which is harmless for it
 if [[ $(uname) != Darwin ]]; then        # macOS skipped due to https://github.com/rust-lang/rust/issues/63047
   coverageFlags+=("-Clink-dead-code")    # Dead code should appear red in the report
 fi
@@ -68,8 +68,14 @@ if [[ -n $CI || -z $1 ]]; then
     $(git grep -l "proc-macro.*true" :**/Cargo.toml | sed 's|Cargo.toml|src/lib.rs|')
 fi
 
-RUST_LOG=solana=trace _ "$cargo" nightly test --target-dir target/cov --no-run "${packages[@]}"
-if RUST_LOG=solana=trace _ "$cargo" nightly test --target-dir target/cov "${packages[@]}" 2> target/cov/coverage-stderr.log; then
+#shellcheck source=ci/common/limit-threads.sh
+source ci/common/limit-threads.sh
+
+_ "$cargo" nightly test --jobs "$JOBS" --target-dir target/cov --no-run "${packages[@]}"
+
+# most verbose log level (trace) is enabled for all solana code to make log!
+# macro code green always
+if RUST_LOG=solana=trace _ ci/intercept.sh "$cargo" nightly test --jobs "$JOBS" --target-dir target/cov "${packages[@]}" -- --nocapture; then
   test_status=0
 else
   test_status=$?

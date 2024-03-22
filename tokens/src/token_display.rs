@@ -1,13 +1,15 @@
-use solana_account_decoder::parse_token::real_number_string_trimmed;
-use solana_sdk::native_token::lamports_to_sol;
-use std::{
-    fmt::{Debug, Display, Formatter, Result},
-    ops::Add,
+use {
+    solana_account_decoder::parse_token::real_number_string_trimmed,
+    solana_sdk::native_token::lamports_to_sol,
+    std::{
+        fmt::{Debug, Display, Formatter, Result},
+        ops::Add,
+    },
 };
 
 const SOL_SYMBOL: &str = "◎";
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum TokenType {
     Sol,
     SplToken,
@@ -24,11 +26,11 @@ impl Token {
         match &self.token_type {
             TokenType::Sol => {
                 let amount = lamports_to_sol(self.amount);
-                write!(f, "{}{}", SOL_SYMBOL, amount)
+                write!(f, "{SOL_SYMBOL}{amount}")
             }
             TokenType::SplToken => {
                 let amount = real_number_string_trimmed(self.amount, self.decimals);
-                write!(f, "{} tokens", amount)
+                write!(f, "{amount} tokens")
             }
         }
     }

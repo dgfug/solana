@@ -1,15 +1,23 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use solana_entry::entry::Entry;
-use solana_ledger::blockstore::{Blockstore, CompletedDataSetInfo};
-use solana_rpc::{max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions};
-use solana_sdk::signature::Signature;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+//! [`CompletedDataSetsService`] is a hub, that runs different operations when a "completed data
+//! set", also known as a [`Vec<Entry>`], is received by the validator.
+//!
+//! Currently, `WindowService` sends [`CompletedDataSetInfo`]s via a `completed_sets_receiver`
+//! provided to the [`CompletedDataSetsService`].
+
+use {
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
+    solana_entry::entry::Entry,
+    solana_ledger::blockstore::{Blockstore, CompletedDataSetInfo},
+    solana_rpc::{max_slots::MaxSlots, rpc_subscriptions::RpcSubscriptions},
+    solana_sdk::signature::Signature,
+    std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread::{self, Builder, JoinHandle},
+        time::Duration,
     },
-    thread::{self, Builder, JoinHandle},
-    time::Duration,
 };
 
 pub type CompletedDataSetsReceiver = Receiver<Vec<CompletedDataSetInfo>>;
@@ -24,12 +32,11 @@ impl CompletedDataSetsService {
         completed_sets_receiver: CompletedDataSetsReceiver,
         blockstore: Arc<Blockstore>,
         rpc_subscriptions: Arc<RpcSubscriptions>,
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
         max_slots: Arc<MaxSlots>,
     ) -> Self {
-        let exit = exit.clone();
         let thread_hdl = Builder::new()
-            .name("completed-data-set-service".to_string())
+            .name("solComplDataSet".to_string())
             .spawn(move || loop {
                 if exit.load(Ordering::Relaxed) {
                     break;
@@ -100,10 +107,14 @@ impl CompletedDataSetsService {
 
 #[cfg(test)]
 pub mod test {
-    use super::*;
-    use solana_sdk::hash::Hash;
-    use solana_sdk::signature::{Keypair, Signer};
-    use solana_sdk::transaction::Transaction;
+    use {
+        super::*,
+        solana_sdk::{
+            hash::Hash,
+            signature::{Keypair, Signer},
+            transaction::Transaction,
+        },
+    };
 
     #[test]
     fn test_zero_signatures() {

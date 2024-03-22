@@ -1,28 +1,33 @@
 [package]
 name = "solana-metrics"
-version = "1.9.0"
 description = "Solana Metrics"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-metrics"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-env_logger = "0.9.0"
-gethostname = "0.2.1"
-lazy_static = "1.4.0"
-log = "0.4.14"
-reqwest = { version = "0.11.5", default-features = false, features = ["blocking", "rustls-tls", "json"] }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
+crossbeam-channel = { workspace = true }
+gethostname = { workspace = true }
+lazy_static = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
+solana-sdk = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-rand = "0.7.0"
-serial_test = "0.5.1"
+env_logger = { workspace = true }
+rand = { workspace = true }
+serial_test = { workspace = true }
 
 [lib]
 name = "solana_metrics"
+
+[[bench]]
+name = "metrics"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

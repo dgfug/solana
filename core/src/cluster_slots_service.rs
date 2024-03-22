@@ -1,17 +1,20 @@
-use crate::cluster_slots::ClusterSlots;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use solana_gossip::cluster_info::ClusterInfo;
-use solana_ledger::blockstore::Blockstore;
-use solana_measure::measure::Measure;
-use solana_runtime::bank_forks::BankForks;
-use solana_sdk::clock::Slot;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        {Arc, RwLock},
+pub mod cluster_slots;
+use {
+    cluster_slots::ClusterSlots,
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
+    solana_gossip::cluster_info::ClusterInfo,
+    solana_ledger::blockstore::Blockstore,
+    solana_measure::measure::Measure,
+    solana_runtime::bank_forks::BankForks,
+    solana_sdk::clock::Slot,
+    std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, RwLock,
+        },
+        thread::{self, Builder, JoinHandle},
+        time::{Duration, Instant},
     },
-    thread::{self, Builder, JoinHandle},
-    time::{Duration, Instant},
 };
 
 pub type ClusterSlotsUpdateReceiver = Receiver<Vec<Slot>>;
@@ -46,7 +49,7 @@ impl ClusterSlotsService {
         Self::initialize_lowest_slot(&blockstore, &cluster_info);
         Self::initialize_epoch_slots(&bank_forks, &cluster_info);
         let t_cluster_slots_service = Builder::new()
-            .name("solana-cluster-slots-service".to_string())
+            .name("solClusterSlots".to_string())
             .spawn(move || {
                 Self::run(
                     blockstore,
@@ -180,19 +183,16 @@ mod test {
     use {
         super::*,
         solana_gossip::{cluster_info::Node, crds_value::LowestSlot},
-        solana_sdk::{pubkey::Pubkey, signature::Keypair},
+        solana_sdk::signature::{Keypair, Signer},
         solana_streamer::socket::SocketAddrSpace,
     };
 
     #[test]
     pub fn test_update_lowest_slot() {
-        let pubkey = Pubkey::new_unique();
+        let keypair = Arc::new(Keypair::new());
+        let pubkey = keypair.pubkey();
         let node_info = Node::new_localhost_with_pubkey(&pubkey);
-        let cluster_info = ClusterInfo::new(
-            node_info.info,
-            Arc::new(Keypair::new()),
-            SocketAddrSpace::Unspecified,
-        );
+        let cluster_info = ClusterInfo::new(node_info.info, keypair, SocketAddrSpace::Unspecified);
         ClusterSlotsService::update_lowest_slot(5, &cluster_info);
         cluster_info.flush_push_queue();
         let lowest = {

@@ -1,21 +1,24 @@
 [package]
 name = "solana-download-utils"
-version = "1.9.0"
 description = "Solana Download Utils"
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-download-utils"
-edition = "2018"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-console = "0.14.1"
-indicatif = "0.16.2"
-log = "0.4.14"
-reqwest = { version = "0.11.5", default-features = false, features = ["blocking", "rustls-tls", "json"] }
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-solana-runtime = { path = "../runtime", version = "=1.9.0" }
+console = { workspace = true }
+indicatif = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
+solana-runtime = { workspace = true }
+solana-sdk = { workspace = true }
+
+[dev-dependencies]
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 
 [lib]
 crate-type = ["lib"]

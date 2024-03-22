@@ -1,7 +1,9 @@
 //! The `logger` module configures `env_logger`
 
-use lazy_static::lazy_static;
-use std::sync::{Arc, RwLock};
+use {
+    lazy_static::lazy_static,
+    std::sync::{Arc, RwLock},
+};
 
 lazy_static! {
     static ref LOGGER: Arc<RwLock<env_logger::Logger>> =
@@ -53,12 +55,9 @@ pub fn setup() {
 }
 
 // Configures file logging with a default filter if RUST_LOG is not set
-//
-// NOTE: This does not work at the moment, pending the resolution of https://github.com/env-logger-rs/env_logger/issues/208
 pub fn setup_file_with_default(logfile: &str, filter: &str) {
     use std::fs::OpenOptions;
     let file = OpenOptions::new()
-        .write(true)
         .create(true)
         .append(true)
         .open(logfile)

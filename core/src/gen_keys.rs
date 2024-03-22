@@ -1,9 +1,11 @@
 //! The `gen_keys` module makes lots of keypairs
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaChaRng;
-use rayon::prelude::*;
-use solana_sdk::signature::Keypair;
+use {
+    rand::{Rng, SeedableRng},
+    rand_chacha::ChaChaRng,
+    rayon::prelude::*,
+    solana_sdk::{signature::Keypair, signer::keypair::keypair_from_seed},
+};
 
 pub struct GenKeys {
     generator: ChaChaRng,
@@ -26,23 +28,27 @@ impl GenKeys {
     }
 
     pub fn gen_keypair(&mut self) -> Keypair {
-        Keypair::generate(&mut self.generator)
+        let mut seed = [0u8; Keypair::SECRET_KEY_LENGTH];
+        self.generator.fill(&mut seed[..]);
+        keypair_from_seed(&seed).unwrap()
     }
 
     pub fn gen_n_keypairs(&mut self, n: u64) -> Vec<Keypair> {
         self.gen_n_seeds(n)
             .into_par_iter()
-            .map(|seed| Keypair::generate(&mut ChaChaRng::from_seed(seed)))
+            .map(|seed| {
+                let mut keypair_seed = [0u8; Keypair::SECRET_KEY_LENGTH];
+                ChaChaRng::from_seed(seed).fill(&mut keypair_seed[..]);
+                keypair_from_seed(&keypair_seed).unwrap()
+            })
             .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     pub use solana_sdk::pubkey::Pubkey;
-    use solana_sdk::signature::Signer;
-    use std::collections::HashSet;
+    use {super::*, solana_sdk::signature::Signer, std::collections::HashSet};
 
     #[test]
     fn test_new_key_is_deterministic() {

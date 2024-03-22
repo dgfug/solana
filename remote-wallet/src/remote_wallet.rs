@@ -1,18 +1,20 @@
+#[cfg(feature = "hidapi")]
+use {crate::ledger::is_valid_ledger, parking_lot::Mutex, std::sync::Arc};
 use {
     crate::{
-        ledger::{is_valid_ledger, LedgerWallet},
+        ledger::LedgerWallet,
         ledger_error::LedgerError,
         locator::{Locator, LocatorError, Manufacturer},
     },
     log::*,
-    parking_lot::{Mutex, RwLock},
+    parking_lot::RwLock,
     solana_sdk::{
         derivation_path::{DerivationPath, DerivationPathError},
         pubkey::Pubkey,
         signature::{Signature, SignerError},
     },
     std::{
-        sync::Arc,
+        rc::Rc,
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -61,6 +63,7 @@ pub enum RemoteWalletError {
     LocatorError(#[from] LocatorError),
 }
 
+#[cfg(feature = "hidapi")]
 impl From<hidapi::HidError> for RemoteWalletError {
     fn from(err: hidapi::HidError) -> RemoteWalletError {
         RemoteWalletError::Hid(err.to_string())
@@ -87,14 +90,16 @@ impl From<RemoteWalletError> for SignerError {
 
 /// Collection of connected RemoteWallets
 pub struct RemoteWalletManager {
+    #[cfg(feature = "hidapi")]
     usb: Arc<Mutex<hidapi::HidApi>>,
     devices: RwLock<Vec<Device>>,
 }
 
 impl RemoteWalletManager {
     /// Create a new instance.
-    pub fn new(usb: Arc<Mutex<hidapi::HidApi>>) -> Arc<Self> {
-        Arc::new(Self {
+    #[cfg(feature = "hidapi")]
+    pub fn new(usb: Arc<Mutex<hidapi::HidApi>>) -> Rc<Self> {
+        Rc::new(Self {
             usb,
             devices: RwLock::new(Vec::new()),
         })
@@ -102,6 +107,7 @@ impl RemoteWalletManager {
 
     /// Repopulate device list
     /// Note: this method iterates over and updates all devices
+    #[cfg(feature = "hidapi")]
     pub fn update_devices(&self) -> Result<usize, RemoteWalletError> {
         let mut usb = self.usb.lock();
         usb.refresh_devices()?;
@@ -126,7 +132,7 @@ impl RemoteWalletManager {
                             detected_devices.push(Device {
                                 path,
                                 info,
-                                wallet_type: RemoteWalletType::Ledger(Arc::new(ledger)),
+                                wallet_type: RemoteWalletType::Ledger(Rc::new(ledger)),
                             })
                         }
                         Err(err) => {
@@ -149,6 +155,13 @@ impl RemoteWalletManager {
         Ok(num_curr_devices - num_prev_devices)
     }
 
+    #[cfg(not(feature = "hidapi"))]
+    pub fn update_devices(&self) -> Result<usize, RemoteWalletError> {
+        Err(RemoteWalletError::Hid(
+            "hidapi crate compilation disabled in solana-remote-wallet.".to_string(),
+        ))
+    }
+
     /// List connected and acknowledged wallets
     pub fn list_devices(&self) -> Vec<RemoteWalletInfo> {
         self.devices.read().iter().map(|d| d.info.clone()).collect()
@@ -159,7 +172,7 @@ impl RemoteWalletManager {
     pub fn get_ledger(
         &self,
         host_device_path: &str,
-    ) -> Result<Arc<LedgerWallet>, RemoteWalletError> {
+    ) -> Result<Rc<LedgerWallet>, RemoteWalletError> {
         self.devices
             .read()
             .iter()
@@ -195,30 +208,45 @@ impl RemoteWalletManager {
 }
 
 /// `RemoteWallet` trait
-pub trait RemoteWallet {
+#[allow(unused_variables)]
+pub trait RemoteWallet<T> {
     fn name(&self) -> &str {
-        "remote wallet"
+        "unimplemented"
     }
 
     /// Parse device info and get device base pubkey
-    fn read_device(
-        &mut self,
-        dev_info: &hidapi::DeviceInfo,
-    ) -> Result<RemoteWalletInfo, RemoteWalletError>;
+    fn read_device(&mut self, dev_info: &T) -> Result<RemoteWalletInfo, RemoteWalletError> {
+        unimplemented!();
+    }
 
     /// Get solana pubkey from a RemoteWallet
     fn get_pubkey(
         &self,
         derivation_path: &DerivationPath,
         confirm_key: bool,
-    ) -> Result<Pubkey, RemoteWalletError>;
+    ) -> Result<Pubkey, RemoteWalletError> {
+        unimplemented!();
+    }
 
-    /// Sign transaction data with wallet managing pubkey at derivation path m/44'/501'/<account>'/<change>'.
+    /// Sign transaction data with wallet managing pubkey at derivation path
+    /// `m/44'/501'/<account>'/<change>'`.
     fn sign_message(
         &self,
         derivation_path: &DerivationPath,
         data: &[u8],
-    ) -> Result<Signature, RemoteWalletError>;
+    ) -> Result<Signature, RemoteWalletError> {
+        unimplemented!();
+    }
+
+    /// Sign off-chain message with wallet managing pubkey at derivation path
+    /// `m/44'/501'/<account>'/<change>'`.
+    fn sign_offchain_message(
+        &self,
+        derivation_path: &DerivationPath,
+        message: &[u8],
+    ) -> Result<Signature, RemoteWalletError> {
+        unimplemented!();
+    }
 }
 
 /// `RemoteWallet` device
@@ -233,7 +261,7 @@ pub struct Device {
 /// Remote wallet convenience enum to hold various wallet types
 #[derive(Debug)]
 pub enum RemoteWalletType {
-    Ledger(Arc<LedgerWallet>),
+    Ledger(Rc<LedgerWallet>),
 }
 
 /// Remote wallet information.
@@ -280,12 +308,19 @@ pub fn is_valid_hid_device(usage_page: u16, interface_number: i32) -> bool {
 }
 
 /// Helper to initialize hidapi and RemoteWalletManager
-pub fn initialize_wallet_manager() -> Result<Arc<RemoteWalletManager>, RemoteWalletError> {
+#[cfg(feature = "hidapi")]
+pub fn initialize_wallet_manager() -> Result<Rc<RemoteWalletManager>, RemoteWalletError> {
     let hidapi = Arc::new(Mutex::new(hidapi::HidApi::new()?));
     Ok(RemoteWalletManager::new(hidapi))
 }
+#[cfg(not(feature = "hidapi"))]
+pub fn initialize_wallet_manager() -> Result<Rc<RemoteWalletManager>, RemoteWalletError> {
+    Err(RemoteWalletError::Hid(
+        "hidapi crate compilation disabled in solana-remote-wallet.".to_string(),
+    ))
+}
 
-pub fn maybe_wallet_manager() -> Result<Option<Arc<RemoteWalletManager>>, RemoteWalletError> {
+pub fn maybe_wallet_manager() -> Result<Option<Rc<RemoteWalletManager>>, RemoteWalletError> {
     let wallet_manager = initialize_wallet_manager()?;
     let device_count = wallet_manager.update_devices()?;
     if device_count > 0 {
@@ -378,7 +413,7 @@ mod tests {
         };
         assert_eq!(
             remote_wallet_info.get_pretty_path(),
-            format!("usb://ledger/{}", pubkey_str)
+            format!("usb://ledger/{pubkey_str}")
         );
     }
 }

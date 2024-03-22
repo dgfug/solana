@@ -134,7 +134,10 @@ where
 mod test {
     use {
         super::*,
-        crate::{crds::Crds, crds_value::CrdsValue},
+        crate::{
+            crds::{Crds, GossipRoute},
+            crds_value::CrdsValue,
+        },
         rand::{thread_rng, Rng},
         solana_sdk::timing::timestamp,
         std::{collections::HashSet, iter::repeat_with, ops::Index},
@@ -144,7 +147,8 @@ mod test {
         let value = CrdsValue::new_rand(rng, None);
         let label = value.label();
         let mut crds = Crds::default();
-        crds.insert(value, timestamp()).unwrap();
+        crds.insert(value, timestamp(), GossipRoute::LocalMessage)
+            .unwrap();
         crds.get::<&VersionedCrdsValue>(&label).cloned().unwrap()
     }
 
@@ -190,7 +194,7 @@ mod test {
         shards.check(&values);
         // Remove some of the values.
         for _ in 0..512 {
-            let index = rng.gen_range(0, values.len());
+            let index = rng.gen_range(0..values.len());
             let value = values.swap_remove(index);
             assert!(shards.remove(index, &value));
             if index < values.len() {
@@ -219,7 +223,7 @@ mod test {
         }
         // Remove everything.
         while !values.is_empty() {
-            let index = rng.gen_range(0, values.len());
+            let index = rng.gen_range(0..values.len());
             let value = values.swap_remove(index);
             assert!(shards.remove(index, &value));
             if index < values.len() {

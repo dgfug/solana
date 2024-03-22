@@ -20,7 +20,7 @@ async fn main() {
     let default_keypair = solana_cli_config::Config::default().keypair_path;
 
     solana_logger::setup_with_default("solana=info");
-    solana_metrics::set_panic_hook("faucet");
+    solana_metrics::set_panic_hook("faucet", /*version:*/ None);
     let matches = App::new(crate_name!())
         .about(crate_description!())
         .version(solana_version::version!())
@@ -81,7 +81,7 @@ async fn main() {
         .into_iter()
         .collect();
 
-    let faucet_addr = socketaddr!(0, FAUCET_PORT);
+    let faucet_addr = socketaddr!(Ipv4Addr::UNSPECIFIED, FAUCET_PORT);
 
     let faucet = Arc::new(Mutex::new(Faucet::new_with_allowed_ips(
         faucet_keypair,

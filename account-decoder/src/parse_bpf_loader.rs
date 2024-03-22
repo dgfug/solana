@@ -1,9 +1,12 @@
-use crate::{
-    parse_account_data::{ParsableAccount, ParseAccountError},
-    UiAccountData, UiAccountEncoding,
+use {
+    crate::{
+        parse_account_data::{ParsableAccount, ParseAccountError},
+        UiAccountData, UiAccountEncoding,
+    },
+    base64::{prelude::BASE64_STANDARD, Engine},
+    bincode::{deserialize, serialized_size},
+    solana_sdk::{bpf_loader_upgradeable::UpgradeableLoaderState, pubkey::Pubkey},
 };
-use bincode::{deserialize, serialized_size};
-use solana_sdk::{bpf_loader_upgradeable::UpgradeableLoaderState, pubkey::Pubkey};
 
 pub fn parse_bpf_upgradeable_loader(
     data: &[u8],
@@ -15,17 +18,17 @@ pub fn parse_bpf_upgradeable_loader(
         UpgradeableLoaderState::Uninitialized => BpfUpgradeableLoaderAccountType::Uninitialized,
         UpgradeableLoaderState::Buffer { authority_address } => {
             let offset = if authority_address.is_some() {
-                UpgradeableLoaderState::buffer_data_offset().unwrap()
+                UpgradeableLoaderState::size_of_buffer_metadata()
             } else {
                 // This case included for code completeness; in practice, a Buffer account will
                 // always have authority_address.is_some()
-                UpgradeableLoaderState::buffer_data_offset().unwrap()
+                UpgradeableLoaderState::size_of_buffer_metadata()
                     - serialized_size(&Pubkey::default()).unwrap() as usize
             };
             BpfUpgradeableLoaderAccountType::Buffer(UiBuffer {
                 authority: authority_address.map(|pubkey| pubkey.to_string()),
                 data: UiAccountData::Binary(
-                    base64::encode(&data[offset as usize..]),
+                    BASE64_STANDARD.encode(&data[offset..]),
                     UiAccountEncoding::Base64,
                 ),
             })
@@ -40,16 +43,16 @@ pub fn parse_bpf_upgradeable_loader(
             upgrade_authority_address,
         } => {
             let offset = if upgrade_authority_address.is_some() {
-                UpgradeableLoaderState::programdata_data_offset().unwrap()
+                UpgradeableLoaderState::size_of_programdata_metadata()
             } else {
-                UpgradeableLoaderState::programdata_data_offset().unwrap()
+                UpgradeableLoaderState::size_of_programdata_metadata()
                     - serialized_size(&Pubkey::default()).unwrap() as usize
             };
             BpfUpgradeableLoaderAccountType::ProgramData(UiProgramData {
                 slot,
                 authority: upgrade_authority_address.map(|pubkey| pubkey.to_string()),
                 data: UiAccountData::Binary(
-                    base64::encode(&data[offset as usize..]),
+                    BASE64_STANDARD.encode(&data[offset..]),
                     UiAccountEncoding::Base64,
                 ),
             })
@@ -58,7 +61,7 @@ pub fn parse_bpf_upgradeable_loader(
     Ok(parsed_account)
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "type", content = "info")]
 pub enum BpfUpgradeableLoaderAccountType {
     Uninitialized,
@@ -67,20 +70,20 @@ pub enum BpfUpgradeableLoaderAccountType {
     ProgramData(UiProgramData),
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiBuffer {
     pub authority: Option<String>,
     pub data: UiAccountData,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiProgram {
     pub program_data: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiProgramData {
     pub slot: u64,
@@ -90,9 +93,7 @@ pub struct UiProgramData {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use bincode::serialize;
-    use solana_sdk::pubkey::Pubkey;
+    use {super::*, bincode::serialize, solana_sdk::pubkey::Pubkey};
 
     #[test]
     fn test_parse_bpf_upgradeable_loader_accounts() {
@@ -115,7 +116,10 @@ mod test {
             parse_bpf_upgradeable_loader(&account_data).unwrap(),
             BpfUpgradeableLoaderAccountType::Buffer(UiBuffer {
                 authority: Some(authority.to_string()),
-                data: UiAccountData::Binary(base64::encode(&program), UiAccountEncoding::Base64),
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&program),
+                    UiAccountEncoding::Base64
+                ),
             })
         );
 
@@ -130,7 +134,10 @@ mod test {
             parse_bpf_upgradeable_loader(&account_data).unwrap(),
             BpfUpgradeableLoaderAccountType::Buffer(UiBuffer {
                 authority: None,
-                data: UiAccountData::Binary(base64::encode(&program), UiAccountEncoding::Base64),
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&program),
+                    UiAccountEncoding::Base64
+                ),
             })
         );
 
@@ -159,7 +166,10 @@ mod test {
             BpfUpgradeableLoaderAccountType::ProgramData(UiProgramData {
                 slot,
                 authority: Some(authority.to_string()),
-                data: UiAccountData::Binary(base64::encode(&program), UiAccountEncoding::Base64),
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&program),
+                    UiAccountEncoding::Base64
+                ),
             })
         );
 
@@ -174,7 +184,10 @@ mod test {
             BpfUpgradeableLoaderAccountType::ProgramData(UiProgramData {
                 slot,
                 authority: None,
-                data: UiAccountData::Binary(base64::encode(&program), UiAccountEncoding::Base64),
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&program),
+                    UiAccountEncoding::Base64
+                ),
             })
         );
     }

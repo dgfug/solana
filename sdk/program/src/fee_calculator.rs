@@ -1,15 +1,19 @@
-#![allow(clippy::integer_arithmetic)]
-use crate::clock::DEFAULT_MS_PER_SLOT;
-use crate::ed25519_program;
-use crate::message::Message;
-use crate::secp256k1_program;
-use log::*;
+//! Calculation of transaction fees.
 
-#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone, Debug, AbiExample)]
+#![allow(clippy::arithmetic_side_effects)]
+use {
+    crate::{clock::DEFAULT_MS_PER_SLOT, ed25519_program, message::Message, secp256k1_program},
+    log::*,
+};
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone, Copy, Debug, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeCalculator {
-    // The current cost of a signature  This amount may increase/decrease over time based on
-    // cluster processing load.
+    /// The current cost of a signature.
+    ///
+    /// This amount may increase/decrease over time based on cluster processing
+    /// load.
     pub lamports_per_signature: u64,
 }
 
@@ -21,7 +25,7 @@ impl FeeCalculator {
     }
 
     #[deprecated(
-        since = "1.8.0",
+        since = "1.9.0",
         note = "Please do not use, will no longer be available in the future"
     )]
     pub fn calculate_fee(&self, message: &Message) -> u64 {
@@ -117,8 +121,7 @@ impl FeeRateGovernor {
                     .min(me.min_lamports_per_signature.max(
                         me.target_lamports_per_signature
                             * std::cmp::min(latest_signatures_per_slot, std::u32::MAX as u64)
-                                as u64
-                            / me.target_signatures_per_slot as u64,
+                            / me.target_signatures_per_slot,
                     ));
 
             trace!(
@@ -162,6 +165,13 @@ impl FeeRateGovernor {
         me
     }
 
+    pub fn clone_with_lamports_per_signature(&self, lamports_per_signature: u64) -> Self {
+        Self {
+            lamports_per_signature,
+            ..*self
+        }
+    }
+
     /// calculate unburned fee from a fee total, returns (unburned, burned)
     pub fn burn(&self, fees: u64) -> (u64, u64) {
         let burned = fees * u64::from(self.burn_percent) / 100;
@@ -176,8 +186,10 @@ impl FeeRateGovernor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{pubkey::Pubkey, system_instruction};
+    use {
+        super::*,
+        crate::{pubkey::Pubkey, system_instruction},
+    };
 
     #[test]
     fn test_fee_rate_governor_burn() {
@@ -202,8 +214,8 @@ mod tests {
         assert_eq!(FeeCalculator::new(1).calculate_fee(&message), 0);
 
         // One signature, a fee.
-        let pubkey0 = Pubkey::new(&[0; 32]);
-        let pubkey1 = Pubkey::new(&[1; 32]);
+        let pubkey0 = Pubkey::from([0; 32]);
+        let pubkey1 = Pubkey::from([1; 32]);
         let ix0 = system_instruction::transfer(&pubkey0, &pubkey1, 1);
         let message = Message::new(&[ix0], Some(&pubkey0));
         assert_eq!(FeeCalculator::new(2).calculate_fee(&message), 2);
@@ -219,8 +231,8 @@ mod tests {
     #[allow(deprecated)]
     fn test_fee_calculator_calculate_fee_secp256k1() {
         use crate::instruction::Instruction;
-        let pubkey0 = Pubkey::new(&[0; 32]);
-        let pubkey1 = Pubkey::new(&[1; 32]);
+        let pubkey0 = Pubkey::from([0; 32]);
+        let pubkey1 = Pubkey::from([1; 32]);
         let ix0 = system_instruction::transfer(&pubkey0, &pubkey1, 1);
         let mut secp_instruction = Instruction {
             program_id: crate::secp256k1_program::id(),

@@ -13,8 +13,8 @@ use {
     },
 };
 
-const MAX_SLOTS_PER_ENTRY: usize = 2048 * 8;
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample)]
+pub const MAX_SLOTS_PER_ENTRY: usize = 2048 * 8;
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, AbiExample)]
 pub struct Uncompressed {
     pub first_slot: Slot,
     pub num: usize,
@@ -42,7 +42,7 @@ impl Sanitize for Uncompressed {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, AbiExample)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, AbiExample)]
 pub struct Flate2 {
     pub first_slot: Slot,
     pub num: usize,
@@ -61,7 +61,7 @@ impl Sanitize for Flate2 {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     CompressError,
     DecompressError,
@@ -156,7 +156,7 @@ impl Uncompressed {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, AbiExample, AbiEnumVisitor)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, AbiExample, AbiEnumVisitor)]
 pub enum CompressedSlots {
     Flate2(Flate2),
     Uncompressed(Uncompressed),
@@ -178,7 +178,7 @@ impl Default for CompressedSlots {
 }
 
 impl CompressedSlots {
-    fn new(max_size: usize) -> Self {
+    pub(crate) fn new(max_size: usize) -> Self {
         CompressedSlots::Uncompressed(Uncompressed::new(max_size))
     }
 
@@ -216,8 +216,7 @@ impl CompressedSlots {
             CompressedSlots::Uncompressed(vals) => {
                 let unc = vals.clone();
                 let compressed = Flate2::deflate(unc)?;
-                let mut new = CompressedSlots::Flate2(compressed);
-                std::mem::swap(self, &mut new);
+                *self = CompressedSlots::Flate2(compressed);
                 Ok(())
             }
             CompressedSlots::Flate2(_) => Ok(()),
@@ -225,7 +224,7 @@ impl CompressedSlots {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, AbiExample)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, AbiExample)]
 pub struct EpochSlots {
     pub from: Pubkey,
     pub slots: Vec<CompressedSlots>,
@@ -327,8 +326,8 @@ impl EpochSlots {
         let now = crds_value::new_rand_timestamp(rng);
         let pubkey = pubkey.unwrap_or_else(solana_sdk::pubkey::new_rand);
         let mut epoch_slots = Self::new(pubkey, now);
-        let num_slots = rng.gen_range(0, 20);
-        let slots: Vec<_> = std::iter::repeat_with(|| 47825632 + rng.gen_range(0, 512))
+        let num_slots = rng.gen_range(0..20);
+        let slots: Vec<_> = std::iter::repeat_with(|| 47825632 + rng.gen_range(0..512))
             .take(num_slots)
             .collect();
         epoch_slots.add(&slots);
@@ -338,7 +337,8 @@ impl EpochSlots {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, rand::Rng, std::iter::repeat_with};
+
     #[test]
     fn test_epoch_slots_max_size() {
         let epoch_slots = EpochSlots::default();
@@ -485,16 +485,18 @@ mod tests {
         assert_eq!(slots.to_slots(0), range);
     }
 
+    fn make_rand_slots<R: Rng>(rng: &mut R) -> impl Iterator<Item = Slot> + '_ {
+        repeat_with(|| rng.gen_range(1..5)).scan(0, |slot, step| {
+            *slot += step;
+            Some(*slot)
+        })
+    }
+
     #[test]
-    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_uncompressed_random_range() {
-        use rand::Rng;
+        let mut rng = rand::thread_rng();
         for _ in 0..10 {
-            let mut range: Vec<Slot> = vec![];
-            for _ in 0..5000 {
-                let last = *range.last().unwrap_or(&0);
-                range.push(last + rand::thread_rng().gen_range(1, 5));
-            }
+            let range: Vec<Slot> = make_rand_slots(&mut rng).take(5000).collect();
             let sz = EpochSlots::default().max_compressed_slot_size();
             let mut slots = Uncompressed::new(sz as usize);
             let sz = slots.add(&range);
@@ -505,15 +507,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_compressed_random_range() {
-        use rand::Rng;
+        let mut rng = rand::thread_rng();
         for _ in 0..10 {
-            let mut range: Vec<Slot> = vec![];
-            for _ in 0..5000 {
-                let last = *range.last().unwrap_or(&0);
-                range.push(last + rand::thread_rng().gen_range(1, 5));
-            }
+            let range: Vec<Slot> = make_rand_slots(&mut rng).take(5000).collect();
             let sz = EpochSlots::default().max_compressed_slot_size();
             let mut slots = Uncompressed::new(sz as usize);
             let sz = slots.add(&range);
@@ -526,15 +523,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::same_item_push)]
     fn test_epoch_slots_fill_random_range() {
-        use rand::Rng;
+        let mut rng = rand::thread_rng();
         for _ in 0..10 {
-            let mut range: Vec<Slot> = vec![];
-            for _ in 0..5000 {
-                let last = *range.last().unwrap_or(&0);
-                range.push(last + rand::thread_rng().gen_range(1, 5));
-            }
+            let range: Vec<Slot> = make_rand_slots(&mut rng).take(5000).collect();
             let mut slots = EpochSlots::default();
             let sz = slots.fill(&range, 1);
             let last = range[sz - 1];

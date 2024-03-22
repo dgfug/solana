@@ -1,33 +1,42 @@
 #![cfg(feature = "full")]
 
+pub use crate::message::{AddressLoader, SimpleAddressLoader};
 use {
+    super::SanitizedVersionedTransaction,
     crate::{
         hash::Hash,
-        message::{v0, MappedAddresses, MappedMessage, SanitizedMessage, VersionedMessage},
-        nonce::NONCED_TX_MARKER_IX_INDEX,
+        message::{
+            legacy,
+            v0::{self, LoadedAddresses},
+            LegacyMessage, SanitizedMessage, VersionedMessage,
+        },
         precompiles::verify_if_precompile,
-        program_utils::limited_deserialize,
         pubkey::Pubkey,
         sanitize::Sanitize,
         signature::Signature,
+        simple_vote_transaction_checker::is_simple_vote_transaction,
         solana_sdk::feature_set,
         transaction::{Result, Transaction, TransactionError, VersionedTransaction},
     },
-    solana_program::{system_instruction::SystemInstruction, system_program},
-    std::convert::TryFrom,
-    std::sync::Arc,
+    solana_program::message::SanitizedVersionedMessage,
 };
 
+/// Maximum number of accounts that a transaction may lock.
+/// 128 was chosen because it is the minimum number of accounts
+/// needed for the Neon EVM implementation.
+pub const MAX_TX_ACCOUNT_LOCKS: usize = 128;
+
 /// Sanitized transaction and the hash of its message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SanitizedTransaction {
     message: SanitizedMessage,
     message_hash: Hash,
+    is_simple_vote_tx: bool,
     signatures: Vec<Signature>,
 }
 
 /// Set of accounts that must be locked for safe transaction processing
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TransactionAccountLocks<'a> {
     /// List of readonly account key locks
     pub readonly: Vec<&'a Pubkey>,
@@ -35,52 +44,88 @@ pub struct TransactionAccountLocks<'a> {
     pub writable: Vec<&'a Pubkey>,
 }
 
-impl TryFrom<Transaction> for SanitizedTransaction {
-    type Error = TransactionError;
-    fn try_from(tx: Transaction) -> Result<Self> {
-        tx.sanitize()?;
+/// Type that represents whether the transaction message has been precomputed or
+/// not.
+pub enum MessageHash {
+    Precomputed(Hash),
+    Compute,
+}
 
-        if tx.message.has_duplicates() {
-            return Err(TransactionError::AccountLoadedTwice);
-        }
-
-        Ok(Self {
-            message_hash: tx.message.hash(),
-            message: SanitizedMessage::Legacy(tx.message),
-            signatures: tx.signatures,
-        })
+impl From<Hash> for MessageHash {
+    fn from(hash: Hash) -> Self {
+        Self::Precomputed(hash)
     }
 }
 
 impl SanitizedTransaction {
-    /// Create a sanitized transaction from an unsanitized transaction.
-    /// If the input transaction uses address maps, attempt to map the
-    /// transaction keys to full addresses.
-    pub fn try_create(
-        tx: VersionedTransaction,
+    /// Create a sanitized transaction from a sanitized versioned transaction.
+    /// If the input transaction uses address tables, attempt to lookup the
+    /// address for each table index.
+    pub fn try_new(
+        tx: SanitizedVersionedTransaction,
         message_hash: Hash,
-        address_mapper: impl Fn(&v0::Message) -> Result<MappedAddresses>,
+        is_simple_vote_tx: bool,
+        address_loader: impl AddressLoader,
     ) -> Result<Self> {
-        tx.sanitize()?;
-
         let signatures = tx.signatures;
-        let message = match tx.message {
-            VersionedMessage::Legacy(message) => SanitizedMessage::Legacy(message),
-            VersionedMessage::V0(message) => SanitizedMessage::V0(MappedMessage {
-                mapped_addresses: address_mapper(&message)?,
-                message,
-            }),
+        let SanitizedVersionedMessage { message } = tx.message;
+        let message = match message {
+            VersionedMessage::Legacy(message) => {
+                SanitizedMessage::Legacy(LegacyMessage::new(message))
+            }
+            VersionedMessage::V0(message) => {
+                let loaded_addresses =
+                    address_loader.load_addresses(&message.address_table_lookups)?;
+                SanitizedMessage::V0(v0::LoadedMessage::new(message, loaded_addresses))
+            }
         };
-
-        if message.has_duplicates() {
-            return Err(TransactionError::AccountLoadedTwice);
-        }
 
         Ok(Self {
             message,
             message_hash,
+            is_simple_vote_tx,
             signatures,
         })
+    }
+
+    /// Create a sanitized transaction from an un-sanitized versioned
+    /// transaction.  If the input transaction uses address tables, attempt to
+    /// lookup the address for each table index.
+    pub fn try_create(
+        tx: VersionedTransaction,
+        message_hash: impl Into<MessageHash>,
+        is_simple_vote_tx: Option<bool>,
+        address_loader: impl AddressLoader,
+    ) -> Result<Self> {
+        let sanitized_versioned_tx = SanitizedVersionedTransaction::try_from(tx)?;
+        let is_simple_vote_tx = is_simple_vote_tx
+            .unwrap_or_else(|| is_simple_vote_transaction(&sanitized_versioned_tx));
+        let message_hash = match message_hash.into() {
+            MessageHash::Compute => sanitized_versioned_tx.message.message.hash(),
+            MessageHash::Precomputed(hash) => hash,
+        };
+        Self::try_new(
+            sanitized_versioned_tx,
+            message_hash,
+            is_simple_vote_tx,
+            address_loader,
+        )
+    }
+
+    pub fn try_from_legacy_transaction(tx: Transaction) -> Result<Self> {
+        tx.sanitize()?;
+
+        Ok(Self {
+            message_hash: tx.message.hash(),
+            message: SanitizedMessage::Legacy(LegacyMessage::new(tx.message)),
+            is_simple_vote_tx: false,
+            signatures: tx.signatures,
+        })
+    }
+
+    /// Create a sanitized transaction from a legacy transaction. Used for tests only.
+    pub fn from_transaction_for_tests(tx: Transaction) -> Self {
+        Self::try_from_legacy_transaction(tx).unwrap()
     }
 
     /// Return the first signature for this transaction.
@@ -109,37 +154,50 @@ impl SanitizedTransaction {
         &self.message_hash
     }
 
+    /// Returns true if this transaction is a simple vote
+    pub fn is_simple_vote_transaction(&self) -> bool {
+        self.is_simple_vote_tx
+    }
+
     /// Convert this sanitized transaction into a versioned transaction for
     /// recording in the ledger.
     pub fn to_versioned_transaction(&self) -> VersionedTransaction {
         let signatures = self.signatures.clone();
         match &self.message {
-            SanitizedMessage::V0(mapped_msg) => VersionedTransaction {
+            SanitizedMessage::V0(sanitized_msg) => VersionedTransaction {
                 signatures,
-                message: VersionedMessage::V0(mapped_msg.message.clone()),
+                message: VersionedMessage::V0(v0::Message::clone(&sanitized_msg.message)),
             },
-            SanitizedMessage::Legacy(message) => VersionedTransaction {
+            SanitizedMessage::Legacy(legacy_message) => VersionedTransaction {
                 signatures,
-                message: VersionedMessage::Legacy(message.clone()),
+                message: VersionedMessage::Legacy(legacy::Message::clone(&legacy_message.message)),
             },
         }
     }
 
+    /// Validate and return the account keys locked by this transaction
+    pub fn get_account_locks(
+        &self,
+        tx_account_lock_limit: usize,
+    ) -> Result<TransactionAccountLocks> {
+        Self::validate_account_locks(self.message(), tx_account_lock_limit)?;
+        Ok(self.get_account_locks_unchecked())
+    }
+
     /// Return the list of accounts that must be locked during processing this transaction.
-    pub fn get_account_locks(&self, demote_program_write_locks: bool) -> TransactionAccountLocks {
+    pub fn get_account_locks_unchecked(&self) -> TransactionAccountLocks {
         let message = &self.message;
+        let account_keys = message.account_keys();
         let num_readonly_accounts = message.num_readonly_accounts();
-        let num_writable_accounts = message
-            .account_keys_len()
-            .saturating_sub(num_readonly_accounts);
+        let num_writable_accounts = account_keys.len().saturating_sub(num_readonly_accounts);
 
         let mut account_locks = TransactionAccountLocks {
             writable: Vec::with_capacity(num_writable_accounts),
             readonly: Vec::with_capacity(num_readonly_accounts),
         };
 
-        for (i, key) in message.account_keys_iter().enumerate() {
-            if message.is_writable(i, demote_program_write_locks) {
+        for (i, key) in account_keys.iter().enumerate() {
+            if message.is_writable(i) {
                 account_locks.writable.push(key);
             } else {
                 account_locks.readonly.push(key);
@@ -149,42 +207,25 @@ impl SanitizedTransaction {
         account_locks
     }
 
+    /// Return the list of addresses loaded from on-chain address lookup tables
+    pub fn get_loaded_addresses(&self) -> LoadedAddresses {
+        match &self.message {
+            SanitizedMessage::Legacy(_) => LoadedAddresses::default(),
+            SanitizedMessage::V0(message) => LoadedAddresses::clone(&message.loaded_addresses),
+        }
+    }
+
     /// If the transaction uses a durable nonce, return the pubkey of the nonce account
     pub fn get_durable_nonce(&self) -> Option<&Pubkey> {
-        self.message
-            .instructions()
-            .get(NONCED_TX_MARKER_IX_INDEX as usize)
-            .filter(
-                |ix| match self.message.get_account_key(ix.program_id_index as usize) {
-                    Some(program_id) => system_program::check_id(program_id),
-                    _ => false,
-                },
-            )
-            .filter(|ix| {
-                matches!(
-                    limited_deserialize(&ix.data),
-                    Ok(SystemInstruction::AdvanceNonceAccount)
-                )
-            })
-            .and_then(|ix| {
-                ix.accounts.get(0).and_then(|idx| {
-                    let idx = *idx as usize;
-                    self.message.get_account_key(idx)
-                })
-            })
+        self.message.get_durable_nonce()
     }
 
     /// Return the serialized message data to sign.
     fn message_data(&self) -> Vec<u8> {
         match &self.message {
-            SanitizedMessage::Legacy(message) => message.serialize(),
-            SanitizedMessage::V0(mapped_msg) => mapped_msg.message.serialize(),
+            SanitizedMessage::Legacy(legacy_message) => legacy_message.message.serialize(),
+            SanitizedMessage::V0(loaded_msg) => loaded_msg.message.serialize(),
         }
-    }
-
-    /// Verify the length of signatures matches the value in the message header
-    pub fn verify_signatures_len(&self) -> bool {
-        self.signatures.len() == self.message.header().num_required_signatures as usize
     }
 
     /// Verify the transaction signatures
@@ -193,7 +234,7 @@ impl SanitizedTransaction {
         if self
             .signatures
             .iter()
-            .zip(self.message.account_keys_iter())
+            .zip(self.message.account_keys().iter())
             .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &message_bytes))
             .any(|verified| !verified)
         {
@@ -204,7 +245,7 @@ impl SanitizedTransaction {
     }
 
     /// Verify the precompiled programs in this transaction
-    pub fn verify_precompiles(&self, feature_set: &Arc<feature_set::FeatureSet>) -> Result<()> {
+    pub fn verify_precompiles(&self, feature_set: &feature_set::FeatureSet) -> Result<()> {
         for (program_id, instruction) in self.message.program_instructions_iter() {
             verify_if_precompile(
                 program_id,
@@ -215,5 +256,108 @@ impl SanitizedTransaction {
             .map_err(|_| TransactionError::InvalidAccountIndex)?;
         }
         Ok(())
+    }
+
+    /// Validate a transaction message against locked accounts
+    pub fn validate_account_locks(
+        message: &SanitizedMessage,
+        tx_account_lock_limit: usize,
+    ) -> Result<()> {
+        if message.has_duplicates() {
+            Err(TransactionError::AccountLoadedTwice)
+        } else if message.account_keys().len() > tx_account_lock_limit {
+            Err(TransactionError::TooManyAccountLocks)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_for_tests(
+        message: SanitizedMessage,
+        signatures: Vec<Signature>,
+        is_simple_vote_tx: bool,
+    ) -> SanitizedTransaction {
+        SanitizedTransaction {
+            message,
+            message_hash: Hash::new_unique(),
+            signatures,
+            is_simple_vote_tx,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use {
+        super::*,
+        crate::signer::{keypair::Keypair, Signer},
+        solana_program::vote::{self, state::Vote},
+    };
+
+    #[test]
+    fn test_try_create_simple_vote_tx() {
+        let bank_hash = Hash::default();
+        let block_hash = Hash::default();
+        let vote_keypair = Keypair::new();
+        let node_keypair = Keypair::new();
+        let auth_keypair = Keypair::new();
+        let votes = Vote::new(vec![1, 2, 3], bank_hash);
+        let vote_ix =
+            vote::instruction::vote(&vote_keypair.pubkey(), &auth_keypair.pubkey(), votes);
+        let mut vote_tx = Transaction::new_with_payer(&[vote_ix], Some(&node_keypair.pubkey()));
+        vote_tx.partial_sign(&[&node_keypair], block_hash);
+        vote_tx.partial_sign(&[&auth_keypair], block_hash);
+
+        // single legacy vote ix, 2 signatures
+        {
+            let vote_transaction = SanitizedTransaction::try_create(
+                VersionedTransaction::from(vote_tx.clone()),
+                MessageHash::Compute,
+                None,
+                SimpleAddressLoader::Disabled,
+            )
+            .unwrap();
+            assert!(vote_transaction.is_simple_vote_transaction());
+        }
+
+        {
+            // call side says it is not a vote
+            let vote_transaction = SanitizedTransaction::try_create(
+                VersionedTransaction::from(vote_tx.clone()),
+                MessageHash::Compute,
+                Some(false),
+                SimpleAddressLoader::Disabled,
+            )
+            .unwrap();
+            assert!(!vote_transaction.is_simple_vote_transaction());
+        }
+
+        // single legacy vote ix, 3 signatures
+        vote_tx.signatures.push(Signature::default());
+        vote_tx.message.header.num_required_signatures = 3;
+        {
+            let vote_transaction = SanitizedTransaction::try_create(
+                VersionedTransaction::from(vote_tx.clone()),
+                MessageHash::Compute,
+                None,
+                SimpleAddressLoader::Disabled,
+            )
+            .unwrap();
+            assert!(!vote_transaction.is_simple_vote_transaction());
+        }
+
+        {
+            // call site says it is simple vote
+            let vote_transaction = SanitizedTransaction::try_create(
+                VersionedTransaction::from(vote_tx),
+                MessageHash::Compute,
+                Some(true),
+                SimpleAddressLoader::Disabled,
+            )
+            .unwrap();
+            assert!(vote_transaction.is_simple_vote_transaction());
+        }
     }
 }

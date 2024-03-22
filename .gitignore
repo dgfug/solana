@@ -1,9 +1,10 @@
-/farf/
+farf/
+target/
 /solana-release/
 /solana-release.tar.bz2
 /solana-metrics/
 /solana-metrics.tar.bz2
-/target/
+/test-ledger/
 
 **/*.rs.bk
 .cargo
@@ -18,7 +19,7 @@ log-*.txt
 log-*/
 
 # intellij files
-/.idea/
+.idea/
 /solana.iml
 /.vscode/
 

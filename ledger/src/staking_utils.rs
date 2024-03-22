@@ -2,10 +2,7 @@
 pub(crate) mod tests {
     use {
         rand::Rng,
-        solana_runtime::{
-            bank::Bank,
-            vote_account::{VoteAccount, VoteAccounts},
-        },
+        solana_runtime::bank::Bank,
         solana_sdk::{
             account::AccountSharedData,
             clock::Clock,
@@ -19,6 +16,7 @@ pub(crate) mod tests {
             },
             transaction::Transaction,
         },
+        solana_vote::vote_account::{VoteAccount, VoteAccounts},
         solana_vote_program::{
             vote_instruction,
             vote_state::{VoteInit, VoteState, VoteStateVersions},
@@ -46,7 +44,7 @@ pub(crate) mod tests {
         process_instructions(
             bank,
             &[from_account, vote_account, validator_identity_account],
-            &vote_instruction::create_account(
+            &vote_instruction::create_account_with_config(
                 &from_account.pubkey(),
                 &vote_pubkey,
                 &VoteInit {
@@ -56,6 +54,10 @@ pub(crate) mod tests {
                     commission: 0,
                 },
                 amount,
+                vote_instruction::CreateVoteAccountConfig {
+                    space: VoteStateVersions::vote_state_size_of(true) as u64,
+                    ..vote_instruction::CreateVoteAccountConfig::default()
+                },
             ),
         );
 
@@ -113,11 +115,12 @@ pub(crate) mod tests {
             let account = AccountSharedData::new_data(
                 rng.gen(), // lamports
                 &VoteStateVersions::new_current(vote_state),
-                &Pubkey::new_unique(), // owner
+                &solana_vote_program::id(), // owner
             )
             .unwrap();
             let vote_pubkey = Pubkey::new_unique();
-            (vote_pubkey, (stake, VoteAccount::from(account)))
+            let vote_account = VoteAccount::try_from(account).unwrap();
+            (vote_pubkey, (stake, vote_account))
         });
         let result = vote_accounts.collect::<VoteAccounts>().staked_nodes();
         assert_eq!(result.len(), 2);

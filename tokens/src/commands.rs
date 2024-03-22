@@ -1,61 +1,74 @@
-use crate::{
-    args::{BalancesArgs, DistributeTokensArgs, SenderStakeArgs, StakeArgs, TransactionLogArgs},
-    db::{self, TransactionInfo},
-    spl_token::*,
-    token_display::Token,
-};
-use chrono::prelude::*;
-use console::style;
-use csv::{ReaderBuilder, Trim};
-use indexmap::IndexMap;
-use indicatif::{ProgressBar, ProgressStyle};
-use pickledb::PickleDb;
-use serde::{Deserialize, Serialize};
-use solana_account_decoder::parse_token::{
-    pubkey_from_spl_token_v2_0, real_number_string, spl_token_v2_0_pubkey,
-};
-use solana_client::{
-    client_error::{ClientError, Result as ClientResult},
-    rpc_client::RpcClient,
-    rpc_config::RpcSendTransactionConfig,
-    rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
-};
-use solana_sdk::{
-    clock::Slot,
-    commitment_config::CommitmentConfig,
-    instruction::Instruction,
-    message::Message,
-    native_token::{lamports_to_sol, sol_to_lamports},
-    signature::{unique_signers, Signature, Signer},
-    stake::{
-        instruction::{self as stake_instruction, LockupArgs},
-        state::{Authorized, Lockup, StakeAuthorize},
+use {
+    crate::{
+        args::{
+            BalancesArgs, DistributeTokensArgs, SenderStakeArgs, StakeArgs, TransactionLogArgs,
+        },
+        db::{self, TransactionInfo},
+        spl_token::*,
+        token_display::Token,
     },
-    system_instruction,
-    transaction::Transaction,
-};
-use solana_transaction_status::TransactionStatus;
-use spl_associated_token_account_v1_0::get_associated_token_address;
-use spl_token_v2_0::solana_program::program_error::ProgramError;
-use std::{
-    cmp::{self},
-    io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+    chrono::prelude::*,
+    console::style,
+    csv::{ReaderBuilder, Trim},
+    indexmap::IndexMap,
+    indicatif::{ProgressBar, ProgressStyle},
+    pickledb::PickleDb,
+    serde::{Deserialize, Serialize},
+    solana_account_decoder::parse_token::real_number_string,
+    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client_api::{
+        client_error::{Error as ClientError, Result as ClientResult},
+        config::RpcSendTransactionConfig,
+        request::{MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS, MAX_MULTIPLE_ACCOUNTS},
     },
-    thread::sleep,
-    time::Duration,
+    solana_sdk::{
+        clock::Slot,
+        commitment_config::CommitmentConfig,
+        hash::Hash,
+        instruction::Instruction,
+        message::Message,
+        native_token::{lamports_to_sol, sol_to_lamports},
+        signature::{unique_signers, Signature, Signer},
+        stake::{
+            instruction::{self as stake_instruction, LockupArgs},
+            state::{Authorized, Lockup, StakeAuthorize, StakeStateV2},
+        },
+        system_instruction,
+        transaction::Transaction,
+    },
+    solana_transaction_status::TransactionStatus,
+    spl_associated_token_account::get_associated_token_address,
+    spl_token::solana_program::program_error::ProgramError,
+    std::{
+        cmp::{self},
+        io,
+        str::FromStr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread::sleep,
+        time::Duration,
+    },
 };
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// Allocation is a helper (mostly for tests), prefer using TypedAllocation instead when possible.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Allocation {
     pub recipient: String,
     pub amount: u64,
     pub lockup_date: String,
 }
 
-#[derive(Debug, PartialEq)]
+/// TypedAllocation is same as Allocation but contains typed fields.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TypedAllocation {
+    pub recipient: Pubkey,
+    pub amount: u64,
+    pub lockup_date: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum FundingSource {
     FeePayer,
     SplTokenAccount,
@@ -71,7 +84,7 @@ impl std::fmt::Debug for FundingSources {
             if i > 0 {
                 write!(f, "/")?;
             }
-            write!(f, "{:?}", source)?;
+            write!(f, "{source:?}")?;
         }
         Ok(())
     }
@@ -95,14 +108,30 @@ type StakeExtras = Vec<(Keypair, Option<DateTime<Utc>>)>;
 pub enum Error {
     #[error("I/O error")]
     IoError(#[from] io::Error),
+    #[error("CSV file seems to be empty")]
+    CsvIsEmptyError,
     #[error("CSV error")]
     CsvError(#[from] csv::Error),
+    #[error("Bad input data for pubkey: {input}, error: {err}")]
+    BadInputPubkeyError {
+        input: String,
+        err: pubkey::ParsePubkeyError,
+    },
+    #[error("Bad input data for lockup date: {input}, error: {err}")]
+    BadInputLockupDate {
+        input: String,
+        err: chrono::ParseError,
+    },
     #[error("PickleDb error")]
     PickleDbError(#[from] pickledb::error::Error),
     #[error("Transport error")]
     ClientError(#[from] ClientError),
     #[error("Missing lockup authority")]
     MissingLockupAuthority,
+    #[error("Missing messages")]
+    MissingMessages,
+    #[error("Error estimating message fees")]
+    FeeEstimationError,
     #[error("insufficient funds in {0:?}, requires {1}")]
     InsufficientFunds(FundingSources, String),
     #[error("Program error")]
@@ -111,15 +140,15 @@ pub enum Error {
     ExitSignal,
 }
 
-fn merge_allocations(allocations: &[Allocation]) -> Vec<Allocation> {
+fn merge_allocations(allocations: &[TypedAllocation]) -> Vec<TypedAllocation> {
     let mut allocation_map = IndexMap::new();
     for allocation in allocations {
         allocation_map
             .entry(&allocation.recipient)
-            .or_insert(Allocation {
-                recipient: allocation.recipient.clone(),
+            .or_insert(TypedAllocation {
+                recipient: allocation.recipient,
                 amount: 0,
-                lockup_date: "".to_string(),
+                lockup_date: None,
             })
             .amount += allocation.amount;
     }
@@ -127,13 +156,13 @@ fn merge_allocations(allocations: &[Allocation]) -> Vec<Allocation> {
 }
 
 /// Return true if the recipient and lockups are the same
-fn has_same_recipient(allocation: &Allocation, transaction_info: &TransactionInfo) -> bool {
-    allocation.recipient == transaction_info.recipient.to_string()
-        && allocation.lockup_date.parse().ok() == transaction_info.lockup_date
+fn has_same_recipient(allocation: &TypedAllocation, transaction_info: &TransactionInfo) -> bool {
+    allocation.recipient == transaction_info.recipient
+        && allocation.lockup_date == transaction_info.lockup_date
 }
 
 fn apply_previous_transactions(
-    allocations: &mut Vec<Allocation>,
+    allocations: &mut Vec<TypedAllocation>,
     transaction_infos: &[TransactionInfo],
 ) {
     for transaction_info in transaction_infos {
@@ -172,7 +201,7 @@ fn transfer<S: Signer>(
 }
 
 fn distribution_instructions(
-    allocation: &Allocation,
+    allocation: &TypedAllocation,
     new_stake_account_address: &Pubkey,
     args: &DistributeTokensArgs,
     lockup_date: Option<DateTime<Utc>>,
@@ -186,7 +215,7 @@ fn distribution_instructions(
         // No stake args; a simple token transfer.
         None => {
             let from = args.sender_keypair.pubkey();
-            let to = allocation.recipient.parse().unwrap();
+            let to = allocation.recipient;
             let lamports = allocation.amount;
             let instruction = system_instruction::transfer(&from, &to, lamports);
             vec![instruction]
@@ -196,7 +225,7 @@ fn distribution_instructions(
         Some(stake_args) => {
             let unlocked_sol = stake_args.unlocked_sol;
             let sender_pubkey = args.sender_keypair.pubkey();
-            let recipient = allocation.recipient.parse().unwrap();
+            let recipient = allocation.recipient;
 
             let mut instructions = match &stake_args.sender_stake_args {
                 // No source stake account, so create a recipient stake account directly.
@@ -227,12 +256,24 @@ fn distribution_instructions(
                 Some(sender_stake_args) => {
                     let stake_authority = sender_stake_args.stake_authority.pubkey();
                     let withdraw_authority = sender_stake_args.withdraw_authority.pubkey();
-                    let mut instructions = stake_instruction::split(
+                    let rent_exempt_reserve = sender_stake_args
+                        .rent_exempt_reserve
+                        .expect("SenderStakeArgs.rent_exempt_reserve should be populated");
+
+                    // Transfer some tokens to stake account to cover rent-exempt reserve.
+                    let mut instructions = vec![system_instruction::transfer(
+                        &sender_pubkey,
+                        new_stake_account_address,
+                        rent_exempt_reserve,
+                    )];
+
+                    // Split to stake account
+                    instructions.append(&mut stake_instruction::split(
                         &sender_stake_args.stake_account_address,
                         &stake_authority,
-                        allocation.amount - unlocked_sol,
+                        allocation.amount - unlocked_sol - rent_exempt_reserve,
                         new_stake_account_address,
-                    );
+                    ));
 
                     // Make the recipient the new stake authority
                     instructions.push(stake_instruction::authorize(
@@ -285,36 +326,41 @@ fn distribution_instructions(
 fn build_messages(
     client: &RpcClient,
     db: &mut PickleDb,
-    allocations: &[Allocation],
+    allocations: &[TypedAllocation],
     args: &DistributeTokensArgs,
     exit: Arc<AtomicBool>,
     messages: &mut Vec<Message>,
     stake_extras: &mut StakeExtras,
     created_accounts: &mut u64,
 ) -> Result<(), Error> {
-    for allocation in allocations.iter() {
+    let mut existing_associated_token_accounts = vec![];
+    if let Some(spl_token_args) = &args.spl_token_args {
+        let allocation_chunks = allocations.chunks(MAX_MULTIPLE_ACCOUNTS);
+        for allocation_chunk in allocation_chunks {
+            let associated_token_addresses = allocation_chunk
+                .iter()
+                .map(|x| {
+                    let wallet_address = x.recipient;
+                    get_associated_token_address(&wallet_address, &spl_token_args.mint)
+                })
+                .collect::<Vec<_>>();
+            let mut maybe_accounts = client.get_multiple_accounts(&associated_token_addresses)?;
+            existing_associated_token_accounts.append(&mut maybe_accounts);
+        }
+    }
+
+    for (i, allocation) in allocations.iter().enumerate() {
         if exit.load(Ordering::SeqCst) {
             db.dump()?;
             return Err(Error::ExitSignal);
         }
         let new_stake_account_keypair = Keypair::new();
-        let lockup_date = if allocation.lockup_date.is_empty() {
-            None
-        } else {
-            Some(allocation.lockup_date.parse::<DateTime<Utc>>().unwrap())
-        };
+        let lockup_date = allocation.lockup_date;
 
         let do_create_associated_token_account = if let Some(spl_token_args) = &args.spl_token_args
         {
-            let wallet_address = allocation.recipient.parse().unwrap();
-            let associated_token_address = get_associated_token_address(
-                &wallet_address,
-                &spl_token_v2_0_pubkey(&spl_token_args.mint),
-            );
-            let do_create_associated_token_account = client
-                .get_multiple_accounts(&[pubkey_from_spl_token_v2_0(&associated_token_address)])?
-                [0]
-            .is_none();
+            let do_create_associated_token_account =
+                existing_associated_token_accounts[i].is_none();
             if do_create_associated_token_account {
                 *created_accounts += 1;
             }
@@ -340,7 +386,11 @@ fn build_messages(
             do_create_associated_token_account,
         );
         let fee_payer_pubkey = args.fee_payer.pubkey();
-        let message = Message::new(&instructions, Some(&fee_payer_pubkey));
+        let message = Message::new_with_blockhash(
+            &instructions,
+            Some(&fee_payer_pubkey),
+            &Hash::default(), // populated by a real blockhash for balance check and submission
+        );
         messages.push(message);
         stake_extras.push((new_stake_account_keypair, lockup_date));
     }
@@ -350,7 +400,7 @@ fn build_messages(
 fn send_messages(
     client: &RpcClient,
     db: &mut PickleDb,
-    allocations: &[Allocation],
+    allocations: &[TypedAllocation],
     args: &DistributeTokensArgs,
     exit: Arc<AtomicBool>,
     messages: Vec<Message>,
@@ -372,7 +422,7 @@ fn send_messages(
                 signers.push(&*sender_stake_args.stake_authority);
                 signers.push(&*sender_stake_args.withdraw_authority);
                 signers.push(&new_stake_account_keypair);
-                if !allocation.lockup_date.is_empty() {
+                if allocation.lockup_date.is_some() {
                     if let Some(lockup_authority) = &sender_stake_args.lockup_authority {
                         signers.push(&**lockup_authority);
                     } else {
@@ -403,7 +453,7 @@ fn send_messages(
                     args.stake_args.as_ref().map(|_| &new_stake_account_address);
                 db::set_transaction_info(
                     db,
-                    &allocation.recipient.parse().unwrap(),
+                    &allocation.recipient,
                     allocation.amount,
                     &transaction,
                     new_stake_account_address_option,
@@ -423,7 +473,7 @@ fn send_messages(
 fn distribute_allocations(
     client: &RpcClient,
     db: &mut PickleDb,
-    allocations: &[Allocation],
+    allocations: &[TypedAllocation],
     args: &DistributeTokensArgs,
     exit: Arc<AtomicBool>,
 ) -> Result<(), Error> {
@@ -458,71 +508,102 @@ fn distribute_allocations(
 fn read_allocations(
     input_csv: &str,
     transfer_amount: Option<u64>,
-    require_lockup_heading: bool,
+    with_lockup: bool,
     raw_amount: bool,
-) -> io::Result<Vec<Allocation>> {
+) -> Result<Vec<TypedAllocation>, Error> {
     let mut rdr = ReaderBuilder::new().trim(Trim::All).from_path(input_csv)?;
     let allocations = if let Some(amount) = transfer_amount {
-        let recipients: Vec<String> = rdr
-            .deserialize()
-            .map(|recipient| recipient.unwrap())
-            .collect();
-        recipients
-            .into_iter()
-            .map(|recipient| Allocation {
-                recipient,
-                amount,
-                lockup_date: "".to_string(),
+        rdr.deserialize()
+            .map(|recipient| {
+                let recipient: String = recipient?;
+                let recipient =
+                    Pubkey::from_str(&recipient).map_err(|err| Error::BadInputPubkeyError {
+                        input: recipient,
+                        err,
+                    })?;
+                Ok(TypedAllocation {
+                    recipient,
+                    amount,
+                    lockup_date: None,
+                })
             })
-            .collect()
-    } else if require_lockup_heading {
-        let recipients: Vec<(String, f64, String)> = rdr
-            .deserialize()
-            .map(|recipient| recipient.unwrap())
-            .collect();
-        recipients
-            .into_iter()
-            .map(|(recipient, amount, lockup_date)| Allocation {
-                recipient,
-                amount: sol_to_lamports(amount),
-                lockup_date,
+            .collect::<Result<Vec<TypedAllocation>, Error>>()?
+    } else if with_lockup {
+        // We only support SOL token in "require lockup" mode.
+        rdr.deserialize()
+            .map(|recipient| {
+                let (recipient, amount, lockup_date): (String, f64, String) = recipient?;
+                let recipient =
+                    Pubkey::from_str(&recipient).map_err(|err| Error::BadInputPubkeyError {
+                        input: recipient,
+                        err,
+                    })?;
+                let lockup_date = if !lockup_date.is_empty() {
+                    let lockup_date = lockup_date.parse::<DateTime<Utc>>().map_err(|err| {
+                        Error::BadInputLockupDate {
+                            input: lockup_date,
+                            err,
+                        }
+                    })?;
+                    Some(lockup_date)
+                } else {
+                    // empty lockup date means no lockup, it's okay to have only some lockups specified
+                    None
+                };
+                Ok(TypedAllocation {
+                    recipient,
+                    amount: sol_to_lamports(amount),
+                    lockup_date,
+                })
             })
-            .collect()
+            .collect::<Result<Vec<TypedAllocation>, Error>>()?
     } else if raw_amount {
-        let recipients: Vec<(String, u64)> = rdr
-            .deserialize()
-            .map(|recipient| recipient.unwrap())
-            .collect();
-        recipients
-            .into_iter()
-            .map(|(recipient, amount)| Allocation {
-                recipient,
-                amount,
-                lockup_date: "".to_string(),
+        rdr.deserialize()
+            .map(|recipient| {
+                let (recipient, amount): (String, u64) = recipient?;
+                let recipient =
+                    Pubkey::from_str(&recipient).map_err(|err| Error::BadInputPubkeyError {
+                        input: recipient,
+                        err,
+                    })?;
+                Ok(TypedAllocation {
+                    recipient,
+                    amount,
+                    lockup_date: None,
+                })
             })
-            .collect()
+            .collect::<Result<Vec<TypedAllocation>, Error>>()?
     } else {
-        let recipients: Vec<(String, f64)> = rdr
-            .deserialize()
-            .map(|recipient| recipient.unwrap())
-            .collect();
-        recipients
-            .into_iter()
-            .map(|(recipient, amount)| Allocation {
-                recipient,
-                amount: sol_to_lamports(amount),
-                lockup_date: "".to_string(),
+        rdr.deserialize()
+            .map(|recipient| {
+                let (recipient, amount): (String, f64) = recipient?;
+                let recipient =
+                    Pubkey::from_str(&recipient).map_err(|err| Error::BadInputPubkeyError {
+                        input: recipient,
+                        err,
+                    })?;
+                Ok(TypedAllocation {
+                    recipient,
+                    amount: sol_to_lamports(amount),
+                    lockup_date: None,
+                })
             })
-            .collect()
+            .collect::<Result<Vec<TypedAllocation>, Error>>()?
     };
+    if allocations.is_empty() {
+        return Err(Error::CsvIsEmptyError);
+    }
     Ok(allocations)
 }
 
 fn new_spinner_progress_bar() -> ProgressBar {
     let progress_bar = ProgressBar::new(42);
-    progress_bar
-        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
-    progress_bar.enable_steady_tick(100);
+    progress_bar.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {wide_msg}")
+            .expect("ProgresStyle::template direct input to be correct"),
+    );
+    progress_bar.enable_steady_tick(Duration::from_millis(100));
     progress_bar
 }
 
@@ -531,11 +612,11 @@ pub fn process_allocations(
     args: &DistributeTokensArgs,
     exit: Arc<AtomicBool>,
 ) -> Result<Option<usize>, Error> {
-    let require_lockup_heading = args.stake_args.is_some();
-    let mut allocations: Vec<Allocation> = read_allocations(
+    let with_lockup = args.stake_args.is_some();
+    let mut allocations: Vec<TypedAllocation> = read_allocations(
         &args.input_csv,
         args.transfer_amount,
-        require_lockup_heading,
+        with_lockup,
         args.spl_token_args.is_some(),
     )?;
 
@@ -722,21 +803,28 @@ fn log_transaction_confirmations(
     Ok(())
 }
 
+pub fn get_fee_estimate_for_messages(
+    messages: &[Message],
+    client: &RpcClient,
+) -> Result<u64, Error> {
+    let mut message = messages.first().ok_or(Error::MissingMessages)?.clone();
+    let latest_blockhash = client.get_latest_blockhash()?;
+    message.recent_blockhash = latest_blockhash;
+    let fee = client.get_fee_for_message(&message)?;
+    let fee_estimate = fee
+        .checked_mul(messages.len() as u64)
+        .ok_or(Error::FeeEstimationError)?;
+    Ok(fee_estimate)
+}
+
 fn check_payer_balances(
     messages: &[Message],
-    allocations: &[Allocation],
+    allocations: &[TypedAllocation],
     client: &RpcClient,
     args: &DistributeTokensArgs,
 ) -> Result<(), Error> {
     let mut undistributed_tokens: u64 = allocations.iter().map(|x| x.amount).sum();
-
-    let fees = messages
-        .iter()
-        .map(|message| client.get_fee_for_message(message))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
-        .iter()
-        .sum();
+    let fees = get_fee_estimate_for_messages(messages, client)?;
 
     let (distribution_source, unlocked_sol_source) = if let Some(stake_args) = &args.stake_args {
         let total_unlocked_sol = allocations.len() as u64 * stake_args.unlocked_sol;
@@ -810,8 +898,12 @@ fn check_payer_balances(
     Ok(())
 }
 
-pub fn process_balances(client: &RpcClient, args: &BalancesArgs) -> Result<(), Error> {
-    let allocations: Vec<Allocation> =
+pub fn process_balances(
+    client: &RpcClient,
+    args: &BalancesArgs,
+    exit: Arc<AtomicBool>,
+) -> Result<(), Error> {
+    let allocations: Vec<TypedAllocation> =
         read_allocations(&args.input_csv, None, false, args.spl_token_args.is_some())?;
     let allocations = merge_allocations(&allocations);
 
@@ -832,10 +924,14 @@ pub fn process_balances(client: &RpcClient, args: &BalancesArgs) -> Result<(), E
     );
 
     for allocation in &allocations {
+        if exit.load(Ordering::SeqCst) {
+            return Err(Error::ExitSignal);
+        }
+
         if let Some(spl_token_args) = &args.spl_token_args {
             print_token_balances(client, allocation, spl_token_args)?;
         } else {
-            let address: Pubkey = allocation.recipient.parse().unwrap();
+            let address: Pubkey = allocation.recipient;
             let expected = lamports_to_sol(allocation.amount);
             let actual = lamports_to_sol(client.get_balance(&address).unwrap());
             println!(
@@ -857,9 +953,15 @@ pub fn process_transaction_log(args: &TransactionLogArgs) -> Result<(), Error> {
     Ok(())
 }
 
-use crate::db::check_output_file;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-use tempfile::{tempdir, NamedTempFile};
+use {
+    crate::db::check_output_file,
+    solana_sdk::{
+        pubkey::{self, Pubkey},
+        signature::Keypair,
+    },
+    tempfile::{tempdir, NamedTempFile},
+};
+
 pub fn test_process_distribute_tokens_with_client(
     client: &RpcClient,
     sender_keypair: Keypair,
@@ -887,12 +989,12 @@ pub fn test_process_distribute_tokens_with_client(
     } else {
         sol_to_lamports(1000.0)
     };
-    let alice_pubkey = solana_sdk::pubkey::new_rand();
+    let alice_pubkey = pubkey::new_rand();
     let allocations_file = NamedTempFile::new().unwrap();
     let input_csv = allocations_file.path().to_str().unwrap().to_string();
     let mut wtr = csv::WriterBuilder::new().from_writer(allocations_file);
-    wtr.write_record(&["recipient", "amount"]).unwrap();
-    wtr.write_record(&[
+    wtr.write_record(["recipient", "amount"]).unwrap();
+    wtr.write_record([
         alice_pubkey.to_string(),
         lamports_to_sol(expected_amount).to_string(),
     ])
@@ -987,13 +1089,13 @@ pub fn test_process_create_stake_with_client(client: &RpcClient, sender_keypair:
         .unwrap();
 
     let expected_amount = sol_to_lamports(1000.0);
-    let alice_pubkey = solana_sdk::pubkey::new_rand();
+    let alice_pubkey = pubkey::new_rand();
     let file = NamedTempFile::new().unwrap();
     let input_csv = file.path().to_str().unwrap().to_string();
     let mut wtr = csv::WriterBuilder::new().from_writer(file);
-    wtr.write_record(&["recipient", "amount", "lockup_date"])
+    wtr.write_record(["recipient", "amount", "lockup_date"])
         .unwrap();
-    wtr.write_record(&[
+    wtr.write_record([
         alice_pubkey.to_string(),
         lamports_to_sol(expected_amount).to_string(),
         "".to_string(),
@@ -1109,13 +1211,13 @@ pub fn test_process_distribute_stake_with_client(client: &RpcClient, sender_keyp
         .unwrap();
 
     let expected_amount = sol_to_lamports(1000.0);
-    let alice_pubkey = solana_sdk::pubkey::new_rand();
+    let alice_pubkey = pubkey::new_rand();
     let file = NamedTempFile::new().unwrap();
     let input_csv = file.path().to_str().unwrap().to_string();
     let mut wtr = csv::WriterBuilder::new().from_writer(file);
-    wtr.write_record(&["recipient", "amount", "lockup_date"])
+    wtr.write_record(["recipient", "amount", "lockup_date"])
         .unwrap();
-    wtr.write_record(&[
+    wtr.write_record([
         alice_pubkey.to_string(),
         lamports_to_sol(expected_amount).to_string(),
         "".to_string(),
@@ -1134,11 +1236,15 @@ pub fn test_process_distribute_stake_with_client(client: &RpcClient, sender_keyp
     let output_file = NamedTempFile::new().unwrap();
     let output_path = output_file.path().to_str().unwrap().to_string();
 
+    let rent_exempt_reserve = client
+        .get_minimum_balance_for_rent_exemption(StakeStateV2::size_of())
+        .unwrap();
     let sender_stake_args = SenderStakeArgs {
         stake_account_address,
         stake_authority: Box::new(stake_authority),
         withdraw_authority: Box::new(withdraw_authority),
         lockup_authority: None,
+        rent_exempt_reserve: Some(rent_exempt_reserve),
     };
     let stake_args = StakeArgs {
         unlocked_sol: sol_to_lamports(1.0),
@@ -1199,32 +1305,34 @@ pub fn test_process_distribute_stake_with_client(client: &RpcClient, sender_keyp
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use solana_core::test_validator::TestValidator;
-    use solana_sdk::{
-        instruction::AccountMeta,
-        signature::{read_keypair_file, write_keypair_file, Signer},
-        stake::instruction::StakeInstruction,
+    use {
+        super::*,
+        solana_sdk::{
+            instruction::AccountMeta,
+            signature::{read_keypair_file, write_keypair_file, Signer},
+            stake::instruction::StakeInstruction,
+        },
+        solana_streamer::socket::SocketAddrSpace,
+        solana_test_validator::TestValidator,
+        solana_transaction_status::TransactionConfirmationStatus,
     };
-    use solana_streamer::socket::SocketAddrSpace;
-    use solana_transaction_status::TransactionConfirmationStatus;
 
-    fn one_signer_message() -> Message {
-        Message::new(
+    fn one_signer_message(client: &RpcClient) -> Message {
+        Message::new_with_blockhash(
             &[Instruction::new_with_bytes(
                 Pubkey::new_unique(),
                 &[],
                 vec![AccountMeta::new(Pubkey::default(), true)],
             )],
             None,
+            &client.get_latest_blockhash().unwrap(),
         )
     }
 
     #[test]
     fn test_process_token_allocations() {
         let alice = Keypair::new();
-        let test_validator =
-            TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+        let test_validator = simple_test_validator_no_fees(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
@@ -1234,19 +1342,24 @@ mod tests {
     #[test]
     fn test_process_transfer_amount_allocations() {
         let alice = Keypair::new();
-        let test_validator =
-            TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+        let test_validator = simple_test_validator_no_fees(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
         test_process_distribute_tokens_with_client(&client, alice, Some(sol_to_lamports(1.5)));
     }
 
+    fn simple_test_validator_no_fees(pubkey: Pubkey) -> TestValidator {
+        let test_validator =
+            TestValidator::with_no_fees(pubkey, None, SocketAddrSpace::Unspecified);
+        test_validator.set_startup_verification_complete_for_tests();
+        test_validator
+    }
+
     #[test]
     fn test_create_stake_allocations() {
         let alice = Keypair::new();
-        let test_validator =
-            TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+        let test_validator = simple_test_validator_no_fees(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
@@ -1256,8 +1369,7 @@ mod tests {
     #[test]
     fn test_process_stake_allocations() {
         let alice = Keypair::new();
-        let test_validator =
-            TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+        let test_validator = simple_test_validator_no_fees(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
@@ -1266,16 +1378,27 @@ mod tests {
 
     #[test]
     fn test_read_allocations() {
-        let alice_pubkey = solana_sdk::pubkey::new_rand();
-        let allocation = Allocation {
-            recipient: alice_pubkey.to_string(),
+        let alice_pubkey = pubkey::new_rand();
+        let allocation = TypedAllocation {
+            recipient: alice_pubkey,
             amount: 42,
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
         let file = NamedTempFile::new().unwrap();
         let input_csv = file.path().to_str().unwrap().to_string();
         let mut wtr = csv::WriterBuilder::new().from_writer(file);
-        wtr.serialize(&allocation).unwrap();
+        wtr.serialize((
+            "recipient".to_string(),
+            "amount".to_string(),
+            "require_lockup".to_string(),
+        ))
+        .unwrap();
+        wtr.serialize((
+            allocation.recipient.to_string(),
+            allocation.amount,
+            allocation.lockup_date,
+        ))
+        .unwrap();
         wtr.flush().unwrap();
 
         assert_eq!(
@@ -1283,10 +1406,10 @@ mod tests {
             vec![allocation]
         );
 
-        let allocation_sol = Allocation {
-            recipient: alice_pubkey.to_string(),
+        let allocation_sol = TypedAllocation {
+            recipient: alice_pubkey,
             amount: sol_to_lamports(42.0),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
 
         assert_eq!(
@@ -1305,8 +1428,8 @@ mod tests {
 
     #[test]
     fn test_read_allocations_no_lockup() {
-        let pubkey0 = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
+        let pubkey0 = pubkey::new_rand();
+        let pubkey1 = pubkey::new_rand();
         let file = NamedTempFile::new().unwrap();
         let input_csv = file.path().to_str().unwrap().to_string();
         let mut wtr = csv::WriterBuilder::new().from_writer(file);
@@ -1317,15 +1440,15 @@ mod tests {
         wtr.flush().unwrap();
 
         let expected_allocations = vec![
-            Allocation {
-                recipient: pubkey0.to_string(),
+            TypedAllocation {
+                recipient: pubkey0,
                 amount: sol_to_lamports(42.0),
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
-            Allocation {
-                recipient: pubkey1.to_string(),
+            TypedAllocation {
+                recipient: pubkey1,
                 amount: sol_to_lamports(43.0),
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
         ];
         assert_eq!(
@@ -1335,68 +1458,236 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_read_allocations_malformed() {
-        let pubkey0 = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
+        let pubkey0 = pubkey::new_rand();
+        let pubkey1 = pubkey::new_rand();
+
+        // Empty file.
         let file = NamedTempFile::new().unwrap();
+        let mut wtr = csv::WriterBuilder::new().from_writer(&file);
+        wtr.flush().unwrap();
         let input_csv = file.path().to_str().unwrap().to_string();
-        let mut wtr = csv::WriterBuilder::new().from_writer(file);
+        let got = read_allocations(&input_csv, None, false, false);
+        assert!(matches!(got, Err(Error::CsvIsEmptyError)));
+
+        // Missing 2nd column.
+        let file = NamedTempFile::new().unwrap();
+        let mut wtr = csv::WriterBuilder::new().from_writer(&file);
+        wtr.serialize("recipient".to_string()).unwrap();
+        wtr.serialize(pubkey0.to_string()).unwrap();
+        wtr.serialize(pubkey1.to_string()).unwrap();
+        wtr.flush().unwrap();
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got = read_allocations(&input_csv, None, false, false);
+        assert!(matches!(got, Err(Error::CsvError(..))));
+
+        // Missing 3rd column.
+        let file = NamedTempFile::new().unwrap();
+        let mut wtr = csv::WriterBuilder::new().from_writer(&file);
         wtr.serialize(("recipient".to_string(), "amount".to_string()))
             .unwrap();
-        wtr.serialize((&pubkey0.to_string(), 42.0)).unwrap();
-        wtr.serialize((&pubkey1.to_string(), 43.0)).unwrap();
+        wtr.serialize((pubkey0.to_string(), "42.0".to_string()))
+            .unwrap();
+        wtr.serialize((pubkey1.to_string(), "43.0".to_string()))
+            .unwrap();
         wtr.flush().unwrap();
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got = read_allocations(&input_csv, None, true, false);
+        assert!(matches!(got, Err(Error::CsvError(..))));
 
-        let expected_allocations = vec![
-            Allocation {
-                recipient: pubkey0.to_string(),
-                amount: sol_to_lamports(42.0),
-                lockup_date: "".to_string(),
-            },
-            Allocation {
-                recipient: pubkey1.to_string(),
-                amount: sol_to_lamports(43.0),
-                lockup_date: "".to_string(),
-            },
-        ];
-        assert_eq!(
-            read_allocations(&input_csv, None, true, false).unwrap(),
-            expected_allocations
+        let generate_csv_file = |header: (String, String, String),
+                                 data: Vec<(String, String, String)>,
+                                 file: &NamedTempFile| {
+            let mut wtr = csv::WriterBuilder::new().from_writer(file);
+            wtr.serialize(header).unwrap();
+            wtr.serialize(&data[0]).unwrap();
+            wtr.serialize(&data[1]).unwrap();
+            wtr.flush().unwrap();
+        };
+
+        let default_header = (
+            "recipient".to_string(),
+            "amount".to_string(),
+            "require_lockup".to_string(),
+        );
+
+        // Bad pubkey (default).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (pubkey0.to_string(), "42.0".to_string(), "".to_string()),
+                ("bad pubkey".to_string(), "43.0".to_string(), "".to_string()),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got_err = read_allocations(&input_csv, None, false, false).unwrap_err();
+        assert!(
+            matches!(got_err, Error::BadInputPubkeyError { input, .. } if input == *"bad pubkey")
+        );
+        // Bad pubkey (with transfer amount).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (pubkey0.to_string(), "42.0".to_string(), "".to_string()),
+                ("bad pubkey".to_string(), "43.0".to_string(), "".to_string()),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got_err = read_allocations(&input_csv, Some(123), false, false).unwrap_err();
+        assert!(
+            matches!(got_err, Error::BadInputPubkeyError { input, .. } if input == *"bad pubkey")
+        );
+        // Bad pubkey (with require lockup).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (
+                    pubkey0.to_string(),
+                    "42.0".to_string(),
+                    "2021-02-07T00:00:00Z".to_string(),
+                ),
+                (
+                    "bad pubkey".to_string(),
+                    "43.0".to_string(),
+                    "2021-02-07T00:00:00Z".to_string(),
+                ),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got_err = read_allocations(&input_csv, None, true, false).unwrap_err();
+        assert!(
+            matches!(got_err, Error::BadInputPubkeyError { input, .. } if input == *"bad pubkey")
+        );
+        // Bad pubkey (with raw amount).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (pubkey0.to_string(), "42".to_string(), "".to_string()),
+                ("bad pubkey".to_string(), "43".to_string(), "".to_string()),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got_err = read_allocations(&input_csv, None, false, true).unwrap_err();
+        assert!(
+            matches!(got_err, Error::BadInputPubkeyError { input, .. } if input == *"bad pubkey")
+        );
+
+        // Bad value in 2nd column (default).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (
+                    pubkey0.to_string(),
+                    "bad amount".to_string(),
+                    "".to_string(),
+                ),
+                (
+                    pubkey1.to_string(),
+                    "43.0".to_string().to_string(),
+                    "".to_string(),
+                ),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got = read_allocations(&input_csv, None, false, false);
+        assert!(matches!(got, Err(Error::CsvError(..))));
+        // Bad value in 2nd column (with require lockup).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (
+                    pubkey0.to_string(),
+                    "bad amount".to_string(),
+                    "".to_string(),
+                ),
+                (pubkey1.to_string(), "43.0".to_string(), "".to_string()),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got = read_allocations(&input_csv, None, true, false);
+        assert!(matches!(got, Err(Error::CsvError(..))));
+        // Bad value in 2nd column (with raw amount).
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (pubkey0.to_string(), "42".to_string(), "".to_string()),
+                (pubkey1.to_string(), "43.0".to_string(), "".to_string()), // bad raw amount
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got = read_allocations(&input_csv, None, false, true);
+        assert!(matches!(got, Err(Error::CsvError(..))));
+
+        // Bad value in 3rd column.
+        let file = NamedTempFile::new().unwrap();
+        generate_csv_file(
+            default_header.clone(),
+            vec![
+                (
+                    pubkey0.to_string(),
+                    "42.0".to_string(),
+                    "2021-01-07T00:00:00Z".to_string(),
+                ),
+                (
+                    pubkey1.to_string(),
+                    "43.0".to_string(),
+                    "bad lockup date".to_string(),
+                ),
+            ],
+            &file,
+        );
+        let input_csv = file.path().to_str().unwrap().to_string();
+        let got_err = read_allocations(&input_csv, None, true, false).unwrap_err();
+        assert!(
+            matches!(got_err, Error::BadInputLockupDate { input, .. } if input == *"bad lockup date")
         );
     }
 
     #[test]
     fn test_read_allocations_transfer_amount() {
-        let pubkey0 = solana_sdk::pubkey::new_rand();
-        let pubkey1 = solana_sdk::pubkey::new_rand();
-        let pubkey2 = solana_sdk::pubkey::new_rand();
+        let pubkey0 = pubkey::new_rand();
+        let pubkey1 = pubkey::new_rand();
+        let pubkey2 = pubkey::new_rand();
         let file = NamedTempFile::new().unwrap();
         let input_csv = file.path().to_str().unwrap().to_string();
         let mut wtr = csv::WriterBuilder::new().from_writer(file);
         wtr.serialize("recipient".to_string()).unwrap();
-        wtr.serialize(&pubkey0.to_string()).unwrap();
-        wtr.serialize(&pubkey1.to_string()).unwrap();
-        wtr.serialize(&pubkey2.to_string()).unwrap();
+        wtr.serialize(pubkey0.to_string()).unwrap();
+        wtr.serialize(pubkey1.to_string()).unwrap();
+        wtr.serialize(pubkey2.to_string()).unwrap();
         wtr.flush().unwrap();
 
         let amount = sol_to_lamports(1.5);
 
         let expected_allocations = vec![
-            Allocation {
-                recipient: pubkey0.to_string(),
+            TypedAllocation {
+                recipient: pubkey0,
                 amount,
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
-            Allocation {
-                recipient: pubkey1.to_string(),
+            TypedAllocation {
+                recipient: pubkey1,
                 amount,
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
-            Allocation {
-                recipient: pubkey2.to_string(),
+            TypedAllocation {
+                recipient: pubkey2,
                 amount,
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
         ];
         assert_eq!(
@@ -1407,18 +1698,18 @@ mod tests {
 
     #[test]
     fn test_apply_previous_transactions() {
-        let alice = solana_sdk::pubkey::new_rand();
-        let bob = solana_sdk::pubkey::new_rand();
+        let alice = pubkey::new_rand();
+        let bob = pubkey::new_rand();
         let mut allocations = vec![
-            Allocation {
-                recipient: alice.to_string(),
+            TypedAllocation {
+                recipient: alice,
                 amount: sol_to_lamports(1.0),
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
-            Allocation {
-                recipient: bob.to_string(),
+            TypedAllocation {
+                recipient: bob,
                 amount: sol_to_lamports(1.0),
-                lockup_date: "".to_string(),
+                lockup_date: None,
             },
         ];
         let transaction_infos = vec![TransactionInfo {
@@ -1431,24 +1722,24 @@ mod tests {
 
         // Ensure that we applied the transaction to the allocation with
         // a matching recipient address (to bob, not alice).
-        assert_eq!(allocations[0].recipient, alice.to_string());
+        assert_eq!(allocations[0].recipient, alice);
     }
 
     #[test]
     fn test_has_same_recipient() {
-        let alice_pubkey = solana_sdk::pubkey::new_rand();
-        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let alice_pubkey = pubkey::new_rand();
+        let bob_pubkey = pubkey::new_rand();
         let lockup0 = "2021-01-07T00:00:00Z".to_string();
         let lockup1 = "9999-12-31T23:59:59Z".to_string();
-        let alice_alloc = Allocation {
-            recipient: alice_pubkey.to_string(),
+        let alice_alloc = TypedAllocation {
+            recipient: alice_pubkey,
             amount: sol_to_lamports(1.0),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
-        let alice_alloc_lockup0 = Allocation {
-            recipient: alice_pubkey.to_string(),
+        let alice_alloc_lockup0 = TypedAllocation {
+            recipient: alice_pubkey,
             amount: sol_to_lamports(1.0),
-            lockup_date: lockup0.clone(),
+            lockup_date: lockup0.parse().ok(),
         };
         let alice_info = TransactionInfo {
             recipient: alice_pubkey,
@@ -1483,18 +1774,18 @@ mod tests {
         )); // Same recipient, same lockups
     }
 
-    const SET_LOCKUP_INDEX: usize = 5;
+    const SET_LOCKUP_INDEX: usize = 6;
 
     #[test]
     fn test_set_split_stake_lockup() {
         let lockup_date_str = "2021-01-07T00:00:00Z";
-        let allocation = Allocation {
-            recipient: Pubkey::default().to_string(),
-            amount: sol_to_lamports(1.0),
-            lockup_date: lockup_date_str.to_string(),
+        let allocation = TypedAllocation {
+            recipient: Pubkey::default(),
+            amount: sol_to_lamports(1.002_282_880),
+            lockup_date: lockup_date_str.parse().ok(),
         };
-        let stake_account_address = solana_sdk::pubkey::new_rand();
-        let new_stake_account_address = solana_sdk::pubkey::new_rand();
+        let stake_account_address = pubkey::new_rand();
+        let new_stake_account_address = pubkey::new_rand();
         let lockup_authority = Keypair::new();
         let lockup_authority_address = lockup_authority.pubkey();
         let sender_stake_args = SenderStakeArgs {
@@ -1502,6 +1793,7 @@ mod tests {
             stake_authority: Box::new(Keypair::new()),
             withdraw_authority: Box::new(Keypair::new()),
             lockup_authority: Some(Box::new(lockup_authority)),
+            rent_exempt_reserve: Some(2_282_880),
         };
         let stake_args = StakeArgs {
             lockup_authority: Some(lockup_authority_address),
@@ -1542,7 +1834,7 @@ mod tests {
         use std::env;
         let out_dir = env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string());
 
-        format!("{}/tmp/{}-{}", out_dir, name, pubkey.to_string())
+        format!("{out_dir}/tmp/{name}-{pubkey}")
     }
 
     fn initialize_check_payer_balances_inputs(
@@ -1550,16 +1842,16 @@ mod tests {
         sender_keypair_file: &str,
         fee_payer: &str,
         stake_args: Option<StakeArgs>,
-    ) -> (Vec<Allocation>, DistributeTokensArgs) {
-        let recipient = solana_sdk::pubkey::new_rand();
-        let allocations = vec![Allocation {
-            recipient: recipient.to_string(),
+    ) -> (Vec<TypedAllocation>, DistributeTokensArgs) {
+        let recipient = pubkey::new_rand();
+        let allocations = vec![TypedAllocation {
+            recipient,
             amount: allocation_amount,
-            lockup_date: "".to_string(),
+            lockup_date: None,
         }];
         let args = DistributeTokensArgs {
-            sender_keypair: read_keypair_file(sender_keypair_file).unwrap().into(),
-            fee_payer: read_keypair_file(fee_payer).unwrap().into(),
+            sender_keypair: Box::new(read_keypair_file(sender_keypair_file).unwrap()),
+            fee_payer: Box::new(read_keypair_file(fee_payer).unwrap()),
             dry_run: false,
             input_csv: "".to_string(),
             transaction_db: "".to_string(),
@@ -1573,21 +1865,18 @@ mod tests {
 
     #[test]
     fn test_check_payer_balances_distribute_tokens_single_payer() {
-        let fees = 10_000;
-        let fees_in_sol = lamports_to_sol(fees);
-
         let alice = Keypair::new();
-        let test_validator = TestValidator::with_custom_fees(
-            alice.pubkey(),
-            fees,
-            None,
-            SocketAddrSpace::Unspecified,
-        );
+        let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
         let sender_keypair_file = tmp_file_path("keypair_file", &alice.pubkey());
         write_keypair_file(&alice, &sender_keypair_file).unwrap();
+
+        let fees = client
+            .get_fee_for_message(&one_signer_message(&client))
+            .unwrap();
+        let fees_in_sol = lamports_to_sol(fees);
 
         let allocation_amount = 1000.0;
 
@@ -1598,21 +1887,17 @@ mod tests {
             &sender_keypair_file,
             None,
         );
-        check_payer_balances(&[one_signer_message()], &allocations, &client, &args).unwrap();
+        check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args).unwrap();
 
         // Unfunded payer
         let unfunded_payer = Keypair::new();
         let unfunded_payer_keypair_file = tmp_file_path("keypair_file", &unfunded_payer.pubkey());
         write_keypair_file(&unfunded_payer, &unfunded_payer_keypair_file).unwrap();
-        args.sender_keypair = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(
@@ -1644,14 +1929,11 @@ mod tests {
             .send_and_confirm_transaction_with_spinner(&transaction)
             .unwrap();
 
-        args.sender_keypair = read_keypair_file(&partially_funded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&partially_funded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair =
+            Box::new(read_keypair_file(&partially_funded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&partially_funded_payer_keypair_file).unwrap());
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(
@@ -1666,18 +1948,17 @@ mod tests {
 
     #[test]
     fn test_check_payer_balances_distribute_tokens_separate_payers() {
-        let fees = 10_000;
-        let fees_in_sol = lamports_to_sol(fees);
+        solana_logger::setup();
         let alice = Keypair::new();
-        let test_validator = TestValidator::with_custom_fees(
-            alice.pubkey(),
-            fees,
-            None,
-            SocketAddrSpace::Unspecified,
-        );
+        let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
+
+        let fees = client
+            .get_fee_for_message(&one_signer_message(&client))
+            .unwrap();
+        let fees_in_sol = lamports_to_sol(fees);
 
         let sender_keypair_file = tmp_file_path("keypair_file", &alice.pubkey());
         write_keypair_file(&alice, &sender_keypair_file).unwrap();
@@ -1705,19 +1986,17 @@ mod tests {
             &sender_keypair_file,
             None,
         );
-        check_payer_balances(&[one_signer_message()], &allocations, &client, &args).unwrap();
+        check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args).unwrap();
 
         // Unfunded sender
         let unfunded_payer = Keypair::new();
         let unfunded_payer_keypair_file = tmp_file_path("keypair_file", &unfunded_payer.pubkey());
         write_keypair_file(&unfunded_payer, &unfunded_payer_keypair_file).unwrap();
-        args.sender_keypair = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&sender_keypair_file).unwrap().into();
+        args.sender_keypair = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&sender_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(sources, vec![FundingSource::SystemAccount].into());
@@ -1727,13 +2006,11 @@ mod tests {
         }
 
         // Unfunded fee payer
-        args.sender_keypair = read_keypair_file(&sender_keypair_file).unwrap().into();
-        args.fee_payer = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair = Box::new(read_keypair_file(&sender_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(sources, vec![FundingSource::FeePayer].into());
@@ -1779,6 +2056,7 @@ mod tests {
             stake_authority: Box::new(stake_authority),
             withdraw_authority: Box::new(withdraw_authority),
             lockup_authority: None,
+            rent_exempt_reserve: Some(2_282_880),
         };
 
         StakeArgs {
@@ -1788,19 +2066,24 @@ mod tests {
         }
     }
 
+    fn simple_test_validator(alice: Pubkey) -> TestValidator {
+        let test_validator =
+            TestValidator::with_custom_fees(alice, 10_000, None, SocketAddrSpace::Unspecified);
+        test_validator.set_startup_verification_complete_for_tests();
+        test_validator
+    }
+
     #[test]
     fn test_check_payer_balances_distribute_stakes_single_payer() {
-        let fees = 10_000;
-        let fees_in_sol = lamports_to_sol(fees);
         let alice = Keypair::new();
-        let test_validator = TestValidator::with_custom_fees(
-            alice.pubkey(),
-            fees,
-            None,
-            SocketAddrSpace::Unspecified,
-        );
+        let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
+
+        let fees = client
+            .get_fee_for_message(&one_signer_message(&client))
+            .unwrap();
+        let fees_in_sol = lamports_to_sol(fees);
 
         let sender_keypair_file = tmp_file_path("keypair_file", &alice.pubkey());
         write_keypair_file(&alice, &sender_keypair_file).unwrap();
@@ -1821,17 +2104,17 @@ mod tests {
             &sender_keypair_file,
             Some(stake_args),
         );
-        check_payer_balances(&[one_signer_message()], &allocations, &client, &args).unwrap();
+        check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args).unwrap();
 
         // Underfunded stake-account
         let expensive_allocation_amount = 5000.0;
-        let expensive_allocations = vec![Allocation {
-            recipient: solana_sdk::pubkey::new_rand().to_string(),
+        let expensive_allocations = vec![TypedAllocation {
+            recipient: pubkey::new_rand(),
             amount: sol_to_lamports(expensive_allocation_amount),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         }];
         let err_result = check_payer_balances(
-            &[one_signer_message()],
+            &[one_signer_message(&client)],
             &expensive_allocations,
             &client,
             &args,
@@ -1851,15 +2134,11 @@ mod tests {
         let unfunded_payer = Keypair::new();
         let unfunded_payer_keypair_file = tmp_file_path("keypair_file", &unfunded_payer.pubkey());
         write_keypair_file(&unfunded_payer, &unfunded_payer_keypair_file).unwrap();
-        args.sender_keypair = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(
@@ -1891,14 +2170,11 @@ mod tests {
             .send_and_confirm_transaction_with_spinner(&transaction)
             .unwrap();
 
-        args.sender_keypair = read_keypair_file(&partially_funded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&partially_funded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair =
+            Box::new(read_keypair_file(&partially_funded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&partially_funded_payer_keypair_file).unwrap());
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(
@@ -1913,18 +2189,17 @@ mod tests {
 
     #[test]
     fn test_check_payer_balances_distribute_stakes_separate_payers() {
-        let fees = 10_000;
-        let fees_in_sol = lamports_to_sol(fees);
+        solana_logger::setup();
         let alice = Keypair::new();
-        let test_validator = TestValidator::with_custom_fees(
-            alice.pubkey(),
-            fees,
-            None,
-            SocketAddrSpace::Unspecified,
-        );
+        let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();
 
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
+
+        let fees = client
+            .get_fee_for_message(&one_signer_message(&client))
+            .unwrap();
+        let fees_in_sol = lamports_to_sol(fees);
 
         let sender_keypair_file = tmp_file_path("keypair_file", &alice.pubkey());
         write_keypair_file(&alice, &sender_keypair_file).unwrap();
@@ -1959,19 +2234,17 @@ mod tests {
             &sender_keypair_file,
             Some(stake_args),
         );
-        check_payer_balances(&[one_signer_message()], &allocations, &client, &args).unwrap();
+        check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args).unwrap();
 
         // Unfunded sender
         let unfunded_payer = Keypair::new();
         let unfunded_payer_keypair_file = tmp_file_path("keypair_file", &unfunded_payer.pubkey());
         write_keypair_file(&unfunded_payer, &unfunded_payer_keypair_file).unwrap();
-        args.sender_keypair = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
-        args.fee_payer = read_keypair_file(&sender_keypair_file).unwrap().into();
+        args.sender_keypair = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&sender_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(sources, vec![FundingSource::SystemAccount].into());
@@ -1981,13 +2254,11 @@ mod tests {
         }
 
         // Unfunded fee payer
-        args.sender_keypair = read_keypair_file(&sender_keypair_file).unwrap().into();
-        args.fee_payer = read_keypair_file(&unfunded_payer_keypair_file)
-            .unwrap()
-            .into();
+        args.sender_keypair = Box::new(read_keypair_file(&sender_keypair_file).unwrap());
+        args.fee_payer = Box::new(read_keypair_file(&unfunded_payer_keypair_file).unwrap());
 
         let err_result =
-            check_payer_balances(&[one_signer_message()], &allocations, &client, &args)
+            check_payer_balances(&[one_signer_message(&client)], &allocations, &client, &args)
                 .unwrap_err();
         if let Error::InsufficientFunds(sources, amount) = err_result {
             assert_eq!(sources, vec![FundingSource::FeePayer].into());
@@ -2044,10 +2315,10 @@ mod tests {
             spl_token_args: None,
             transfer_amount: None,
         };
-        let allocation = Allocation {
-            recipient: recipient.to_string(),
+        let allocation = TypedAllocation {
+            recipient,
             amount: sol_to_lamports(1.0),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
 
         let mut messages: Vec<Message> = vec![];
@@ -2166,10 +2437,10 @@ mod tests {
             spl_token_args: None,
             transfer_amount: None,
         };
-        let allocation = Allocation {
-            recipient: recipient.to_string(),
+        let allocation = TypedAllocation {
+            recipient,
             amount: sol_to_lamports(1.0),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
         let message = transaction.message.clone();
 
@@ -2240,11 +2511,7 @@ mod tests {
     #[test]
     fn test_distribute_allocations_dump_db() {
         let sender_keypair = Keypair::new();
-        let test_validator = TestValidator::with_no_fees(
-            sender_keypair.pubkey(),
-            None,
-            SocketAddrSpace::Unspecified,
-        );
+        let test_validator = simple_test_validator_no_fees(sender_keypair.pubkey());
         let url = test_validator.rpc_url();
         let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
 
@@ -2269,10 +2536,10 @@ mod tests {
             .to_string();
         let mut db = db::open_db(&db_file, false).unwrap();
         let recipient = Pubkey::new_unique();
-        let allocation = Allocation {
-            recipient: recipient.to_string(),
+        let allocation = TypedAllocation {
+            recipient,
             amount: sol_to_lamports(1.0),
-            lockup_date: "".to_string(),
+            lockup_date: None,
         };
         // This is just dummy data; Args will not affect messages
         let args = DistributeTokensArgs {

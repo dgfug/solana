@@ -1,15 +1,34 @@
-use crate::{
-    clock::{Epoch, INITIAL_RENT_EPOCH},
-    lamports::LamportsError,
-    pubkey::Pubkey,
+//! The Solana [`Account`] type.
+
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
+use {
+    crate::{
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
+        clock::{Epoch, INITIAL_RENT_EPOCH},
+        lamports::LamportsError,
+        loader_v4,
+        pubkey::Pubkey,
+    },
+    serde::{
+        ser::{Serialize, Serializer},
+        Deserialize,
+    },
+    solana_program::{account_info::AccountInfo, debug_account_data::*, sysvar::Sysvar},
+    std::{
+        cell::{Ref, RefCell},
+        fmt,
+        mem::MaybeUninit,
+        ptr,
+        rc::Rc,
+        sync::Arc,
+    },
 };
-use solana_program::{account_info::AccountInfo, sysvar::Sysvar};
-use std::{cell::Ref, cell::RefCell, cmp, fmt, rc::Rc, sync::Arc};
 
 /// An Account with data that is stored on chain
 #[repr(C)]
 #[frozen_abi(digest = "HawRVHh7t4d3H3bitWHFt25WhhoDmbJMCfWdESQQoYEy")]
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Default, AbiExample)]
+#[derive(Deserialize, PartialEq, Eq, Clone, Default, AbiExample)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     /// lamports in the account
@@ -25,10 +44,68 @@ pub struct Account {
     pub rent_epoch: Epoch,
 }
 
+// mod because we need 'Account' below to have the name 'Account' to match expected serialization
+mod account_serialize {
+    use {
+        crate::{account::ReadableAccount, clock::Epoch, pubkey::Pubkey},
+        serde::{ser::Serializer, Serialize},
+    };
+    #[repr(C)]
+    #[frozen_abi(digest = "HawRVHh7t4d3H3bitWHFt25WhhoDmbJMCfWdESQQoYEy")]
+    #[derive(Serialize, AbiExample)]
+    #[serde(rename_all = "camelCase")]
+    struct Account<'a> {
+        lamports: u64,
+        #[serde(with = "serde_bytes")]
+        // a slice so we don't have to make a copy just to serialize this
+        data: &'a [u8],
+        owner: &'a Pubkey,
+        executable: bool,
+        rent_epoch: Epoch,
+    }
+
+    /// allows us to implement serialize on AccountSharedData that is equivalent to Account::serialize without making a copy of the Vec<u8>
+    pub fn serialize_account<S>(
+        account: &impl ReadableAccount,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let temp = Account {
+            lamports: account.lamports(),
+            data: account.data(),
+            owner: account.owner(),
+            executable: account.executable(),
+            rent_epoch: account.rent_epoch(),
+        };
+        temp.serialize(serializer)
+    }
+}
+
+impl Serialize for Account {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        crate::account::account_serialize::serialize_account(self, serializer)
+    }
+}
+
+impl Serialize for AccountSharedData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        crate::account::account_serialize::serialize_account(self, serializer)
+    }
+}
+
 /// An Account with data that is stored on chain
 /// This will be the in-memory representation of the 'Account' struct data.
 /// The existing 'Account' structure cannot easily change due to downstream projects.
-#[derive(PartialEq, Eq, Clone, Default, AbiExample)]
+#[derive(PartialEq, Eq, Clone, Default, AbiExample, Deserialize)]
+#[serde(from = "Account")]
 pub struct AccountSharedData {
     /// lamports in the account
     lamports: u64,
@@ -47,10 +124,10 @@ pub struct AccountSharedData {
 /// Returns true if accounts are essentially equivalent as in all fields are equivalent.
 pub fn accounts_equal<T: ReadableAccount, U: ReadableAccount>(me: &T, other: &U) -> bool {
     me.lamports() == other.lamports()
-        && me.data() == other.data()
-        && me.owner() == other.owner()
         && me.executable() == other.executable()
         && me.rent_epoch() == other.rent_epoch()
+        && me.owner() == other.owner()
+        && me.data() == other.data()
 }
 
 impl From<AccountSharedData> for Account {
@@ -95,6 +172,12 @@ pub trait WritableAccount: ReadableAccount {
                 .ok_or(LamportsError::ArithmeticUnderflow)?,
         );
         Ok(())
+    }
+    fn saturating_add_lamports(&mut self, lamports: u64) {
+        self.set_lamports(self.lamports().saturating_add(lamports))
+    }
+    fn saturating_sub_lamports(&mut self, lamports: u64) {
+        self.set_lamports(self.lamports().saturating_sub(lamports))
     }
     fn data_as_mut_slice(&mut self) -> &mut [u8];
     fn set_owner(&mut self, owner: Pubkey);
@@ -186,8 +269,7 @@ impl WritableAccount for AccountSharedData {
         self.lamports = lamports;
     }
     fn data_as_mut_slice(&mut self) -> &mut [u8] {
-        let data = Arc::make_mut(&mut self.data);
-        &mut data[..]
+        &mut self.data_mut()[..]
     }
     fn set_owner(&mut self, owner: Pubkey) {
         self.owner = owner;
@@ -234,6 +316,10 @@ impl ReadableAccount for AccountSharedData {
     fn rent_epoch(&self) -> Epoch {
         self.rent_epoch
     }
+    fn to_account_shared_data(&self) -> AccountSharedData {
+        // avoid data copy here
+        self.clone()
+    }
 }
 
 impl ReadableAccount for Ref<'_, AccountSharedData> {
@@ -251,6 +337,16 @@ impl ReadableAccount for Ref<'_, AccountSharedData> {
     }
     fn rent_epoch(&self) -> Epoch {
         self.rent_epoch
+    }
+    fn to_account_shared_data(&self) -> AccountSharedData {
+        AccountSharedData {
+            lamports: self.lamports(),
+            // avoid data copy here
+            data: Arc::clone(&self.data),
+            owner: *self.owner(),
+            executable: self.executable(),
+            rent_epoch: self.rent_epoch(),
+        }
     }
 }
 
@@ -273,22 +369,16 @@ impl ReadableAccount for Ref<'_, Account> {
 }
 
 fn debug_fmt<T: ReadableAccount>(item: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let data_len = cmp::min(64, item.data().len());
-    let data_str = if data_len > 0 {
-        format!(" data: {}", hex::encode(item.data()[..data_len].to_vec()))
-    } else {
-        "".to_string()
-    };
-    write!(
-        f,
-        "Account {{ lamports: {} data.len: {} owner: {} executable: {} rent_epoch: {}{} }}",
-        item.lamports(),
-        item.data().len(),
-        item.owner(),
-        item.executable(),
-        item.rent_epoch(),
-        data_str,
-    )
+    let mut f = f.debug_struct("Account");
+
+    f.field("lamports", &item.lamports())
+        .field("data.len", &item.data().len())
+        .field("owner", &item.owner())
+        .field("executable", &item.executable())
+        .field("rent_epoch", &item.rent_epoch());
+    debug_account_data(item.data(), &mut f);
+
+    f.finish()
 }
 
 impl fmt::Debug for Account {
@@ -310,6 +400,21 @@ fn shared_new<T: WritableAccount>(lamports: u64, space: usize, owner: &Pubkey) -
         *owner,
         bool::default(),
         Epoch::default(),
+    )
+}
+
+fn shared_new_rent_epoch<T: WritableAccount>(
+    lamports: u64,
+    space: usize,
+    owner: &Pubkey,
+    rent_epoch: Epoch,
+) -> T {
+    T::create(
+        lamports,
+        vec![0u8; space],
+        *owner,
+        bool::default(),
+        rent_epoch,
     )
 }
 
@@ -381,7 +486,7 @@ fn shared_serialize_data<T: serde::Serialize, U: WritableAccount>(
     if bincode::serialized_size(state)? > account.data().len() as u64 {
         return Err(Box::new(bincode::ErrorKind::SizeLimit));
     }
-    bincode::serialize_into(&mut account.data_as_mut_slice(), state)
+    bincode::serialize_into(account.data_as_mut_slice(), state)
 }
 
 impl Account {
@@ -421,6 +526,9 @@ impl Account {
     ) -> Result<RefCell<Self>, bincode::Error> {
         shared_new_ref_data_with_space(lamports, state, space, owner)
     }
+    pub fn new_rent_epoch(lamports: u64, space: usize, owner: &Pubkey, rent_epoch: Epoch) -> Self {
+        shared_new_rent_epoch(lamports, space, owner, rent_epoch)
+    }
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T, bincode::Error> {
         shared_deserialize_data(self)
     }
@@ -430,17 +538,78 @@ impl Account {
 }
 
 impl AccountSharedData {
-    pub fn set_data_from_slice(&mut self, data: &[u8]) {
-        let len = self.data.len();
-        let len_different = len != data.len();
-        let different = len_different || data != &self.data[..];
-        if different {
-            self.data = Arc::new(data.to_vec());
-        }
+    pub fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.data) > 1
     }
-    pub fn set_data(&mut self, data: Vec<u8>) {
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.data_mut().reserve(additional)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn data_mut(&mut self) -> &mut Vec<u8> {
+        Arc::make_mut(&mut self.data)
+    }
+
+    pub fn resize(&mut self, new_len: usize, value: u8) {
+        self.data_mut().resize(new_len, value)
+    }
+
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        self.data_mut().extend_from_slice(data)
+    }
+
+    pub fn set_data_from_slice(&mut self, new_data: &[u8]) {
+        // If the buffer isn't shared, we're going to memcpy in place.
+        let Some(data) = Arc::get_mut(&mut self.data) else {
+            // If the buffer is shared, the cheapest thing to do is to clone the
+            // incoming slice and replace the buffer.
+            return self.set_data(new_data.to_vec());
+        };
+
+        let new_len = new_data.len();
+
+        // Reserve additional capacity if needed. Here we make the assumption
+        // that growing the current buffer is cheaper than doing a whole new
+        // allocation to make `new_data` owned.
+        //
+        // This assumption holds true during CPI, especially when the account
+        // size doesn't change but the account is only changed in place. And
+        // it's also true when the account is grown by a small margin (the
+        // realloc limit is quite low), in which case the allocator can just
+        // update the allocation metadata without moving.
+        //
+        // Shrinking and copying in place is always faster than making
+        // `new_data` owned, since shrinking boils down to updating the Vec's
+        // length.
+
+        data.reserve(new_len.saturating_sub(data.len()));
+
+        // Safety:
+        // We just reserved enough capacity. We set data::len to 0 to avoid
+        // possible UB on panic (dropping uninitialized elements), do the copy,
+        // finally set the new length once everything is initialized.
+        #[allow(clippy::uninit_vec)]
+        // this is a false positive, the lint doesn't currently special case set_len(0)
+        unsafe {
+            data.set_len(0);
+            ptr::copy_nonoverlapping(new_data.as_ptr(), data.as_mut_ptr(), new_len);
+            data.set_len(new_len);
+        };
+    }
+
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+    fn set_data(&mut self, data: Vec<u8>) {
         self.data = Arc::new(data);
     }
+
+    pub fn spare_data_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.data_mut().spare_capacity_mut()
+    }
+
     pub fn new(lamports: u64, space: usize, owner: &Pubkey) -> Self {
         shared_new(lamports, space, owner)
     }
@@ -476,6 +645,9 @@ impl AccountSharedData {
         owner: &Pubkey,
     ) -> Result<RefCell<Self>, bincode::Error> {
         shared_new_ref_data_with_space(lamports, state, space, owner)
+    }
+    pub fn new_rent_epoch(lamports: u64, space: usize, owner: &Pubkey, rent_epoch: Epoch) -> Self {
+        shared_new_rent_epoch(lamports, space, owner, rent_epoch)
     }
     pub fn deserialize_data<T: serde::de::DeserializeOwned>(&self) -> Result<T, bincode::Error> {
         shared_deserialize_data(self)
@@ -582,6 +754,14 @@ pub fn create_is_signer_account_infos<'a>(
         })
         .collect()
 }
+
+/// Replacement for the executable flag: An account being owned by one of these contains a program.
+pub const PROGRAM_OWNERS: &[Pubkey] = &[
+    bpf_loader_upgradeable::id(),
+    bpf_loader::id(),
+    bpf_loader_deprecated::id(),
+    loader_v4::id(),
+];
 
 #[cfg(test)]
 pub mod tests {
@@ -791,6 +971,28 @@ pub mod tests {
         let key = Pubkey::new_unique();
         let (_account1, mut account2) = make_two_accounts(&key);
         account2.checked_sub_lamports(u64::MAX).unwrap();
+    }
+
+    #[test]
+    fn test_account_saturating_add_lamports() {
+        let key = Pubkey::new_unique();
+        let (mut account, _) = make_two_accounts(&key);
+
+        let remaining = 22;
+        account.set_lamports(u64::MAX - remaining);
+        account.saturating_add_lamports(remaining * 2);
+        assert_eq!(account.lamports(), u64::MAX);
+    }
+
+    #[test]
+    fn test_account_saturating_sub_lamports() {
+        let key = Pubkey::new_unique();
+        let (mut account, _) = make_two_accounts(&key);
+
+        let remaining = 33;
+        account.set_lamports(remaining);
+        account.saturating_sub_lamports(remaining * 2);
+        assert_eq!(account.lamports(), 0);
     }
 
     #[test]

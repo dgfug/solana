@@ -1,7 +1,10 @@
-use rand::{thread_rng, Rng};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use {
+    rand::{thread_rng, Rng},
+    std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+    },
+};
 
 // A temporary burst in the workload can cause a large number of allocations,
 // after which they will be recycled and still reside in memory. If the number
@@ -11,14 +14,19 @@ use std::sync::{Arc, Mutex, Weak};
 // cushion against *normal* variations in the workload while bounding the
 // number of redundant garbage collected objects after temporary bursts.
 const RECYCLER_SHRINK_SIZE: usize = 1024;
-// Lookback window for averaging number of garbage collected objects in terms
-// of number of allocations.
+
+// Lookback window for exponential moving averaging number of garbage collected
+// objects in terms of number of allocations. The half-life of the decaying
+// factor based on the window size defined below is 11356. This means a sample
+// of gc.size() that is 11356 allocations ago has half of the weight as the most
+// recent sample of gc.size() at current allocation.
 const RECYCLER_SHRINK_WINDOW: usize = 16384;
 
 #[derive(Debug, Default)]
 struct RecyclerStats {
     total: AtomicUsize,
     reuse: AtomicUsize,
+    freed: AtomicUsize,
     max_gc: AtomicUsize,
 }
 
@@ -38,7 +46,7 @@ pub struct RecyclerX<T> {
 
 impl<T: Default> Default for RecyclerX<T> {
     fn default() -> RecyclerX<T> {
-        let id = thread_rng().gen_range(0, 1000);
+        let id = thread_rng().gen_range(0..1000);
         trace!("new recycler..{}", id);
         RecyclerX {
             gc: Mutex::default(),
@@ -46,6 +54,15 @@ impl<T: Default> Default for RecyclerX<T> {
             id,
             size_factor: AtomicUsize::default(),
         }
+    }
+}
+
+#[cfg(RUSTC_WITH_SPECIALIZATION)]
+impl solana_frozen_abi::abi_example::AbiExample
+    for RecyclerX<crate::cuda_runtime::PinnedVec<solana_sdk::packet::Packet>>
+{
+    fn example() -> Self {
+        Self::default()
     }
 }
 
@@ -145,6 +162,10 @@ impl<T: Default + Reset> RecyclerX<T> {
             if gc.len() > RECYCLER_SHRINK_SIZE
                 && self.size_factor.load(Ordering::Acquire) >= SIZE_FACTOR_AFTER_SHRINK
             {
+                self.stats.freed.fetch_add(
+                    gc.len().saturating_sub(RECYCLER_SHRINK_SIZE),
+                    Ordering::Relaxed,
+                );
                 for mut x in gc.drain(RECYCLER_SHRINK_SIZE..) {
                     x.set_recycler(Weak::default());
                 }
@@ -166,7 +187,7 @@ impl<T: Default + Reset> RecyclerX<T> {
         }
         let total = self.stats.total.load(Ordering::Relaxed);
         let reuse = self.stats.reuse.load(Ordering::Relaxed);
-        let freed = self.stats.total.fetch_add(1, Ordering::Relaxed);
+        let freed = self.stats.freed.load(Ordering::Relaxed);
         datapoint_debug!(
             "recycler",
             ("gc_len", len as i64, i64),
@@ -179,9 +200,7 @@ impl<T: Default + Reset> RecyclerX<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::packet::PacketsRecycler;
-    use std::iter::repeat_with;
+    use {super::*, crate::packet::PacketBatchRecycler, std::iter::repeat_with};
 
     impl Reset for u64 {
         fn reset(&mut self) {
@@ -208,7 +227,7 @@ mod tests {
     #[test]
     fn test_recycler_shrink() {
         let mut rng = rand::thread_rng();
-        let recycler = PacketsRecycler::default();
+        let recycler = PacketBatchRecycler::default();
         // Allocate a burst of packets.
         const NUM_PACKETS: usize = RECYCLER_SHRINK_SIZE * 2;
         {
@@ -219,10 +238,10 @@ mod tests {
         assert_eq!(recycler.recycler.gc.lock().unwrap().len(), NUM_PACKETS);
         // Process a normal load of packets for a while.
         for _ in 0..RECYCLER_SHRINK_WINDOW / 16 {
-            let count = rng.gen_range(1, 128);
+            let count = rng.gen_range(1..128);
             let _packets: Vec<_> = repeat_with(|| recycler.allocate("")).take(count).collect();
         }
-        // Assert that the gc size has shrinked.
+        // Assert that the gc size has shrunk.
         assert_eq!(
             recycler.recycler.gc.lock().unwrap().len(),
             RECYCLER_SHRINK_SIZE

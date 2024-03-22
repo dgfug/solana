@@ -1,10 +1,8 @@
-use solana_sdk::{instruction::InstructionError, process_instruction::InvokeContext};
+use solana_program_runtime::declare_process_instruction;
 
-pub fn process_instruction(
-    _first_instruction_account: usize,
-    _data: &[u8],
-    _invoke_context: &mut dyn InvokeContext,
-) -> Result<(), InstructionError> {
+pub const DEFAULT_COMPUTE_UNITS: u64 = 150;
+
+declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |_invoke_context| {
     // Do nothing, compute budget instructions handled by the runtime
     Ok(())
-}
+});

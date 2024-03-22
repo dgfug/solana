@@ -1,6 +1,7 @@
 use {
-    crate::duplicate_shred,
-    std::{io, sync},
+    crate::{contact_info, duplicate_shred},
+    crossbeam_channel::{RecvTimeoutError, SendError},
+    std::io,
     thiserror::Error,
 };
 
@@ -11,17 +12,19 @@ pub enum GossipError {
     #[error(transparent)]
     DuplicateShredError(#[from] duplicate_shred::Error),
     #[error(transparent)]
+    InvalidContactInfo(#[from] contact_info::Error),
+    #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    RecvTimeoutError(#[from] sync::mpsc::RecvTimeoutError),
+    RecvTimeoutError(#[from] RecvTimeoutError),
     #[error("send error")]
     SendError,
     #[error("serialization error")]
     Serialize(#[from] Box<bincode::ErrorKind>),
 }
 
-impl<T> std::convert::From<sync::mpsc::SendError<T>> for GossipError {
-    fn from(_e: sync::mpsc::SendError<T>) -> GossipError {
+impl<T> std::convert::From<SendError<T>> for GossipError {
+    fn from(_e: SendError<T>) -> GossipError {
         GossipError::SendError
     }
 }

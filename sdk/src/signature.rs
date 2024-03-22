@@ -1,18 +1,19 @@
-//! The `signature` module provides functionality for public, and private keys.
+//! Functionality for public and private keys.
 #![cfg(feature = "full")]
-
-use crate::pubkey::Pubkey;
-use generic_array::{typenum::U64, GenericArray};
-use std::{
-    borrow::{Borrow, Cow},
-    convert::TryInto,
-    fmt, mem,
-    str::FromStr,
-};
-use thiserror::Error;
 
 // legacy module paths
 pub use crate::signer::{keypair::*, null_signer::*, presigner::*, *};
+use {
+    crate::pubkey::Pubkey,
+    generic_array::{typenum::U64, GenericArray},
+    std::{
+        borrow::{Borrow, Cow},
+        convert::TryInto,
+        fmt,
+        str::FromStr,
+    },
+    thiserror::Error,
+};
 
 /// Number of bytes in a signature
 pub const SIGNATURE_BYTES: usize = 64;
@@ -28,8 +29,16 @@ pub struct Signature(GenericArray<u8, U64>);
 impl crate::sanitize::Sanitize for Signature {}
 
 impl Signature {
+    #[deprecated(
+        since = "1.16.4",
+        note = "Please use 'Signature::from' or 'Signature::try_from' instead"
+    )]
     pub fn new(signature_slice: &[u8]) -> Self {
         Self(GenericArray::clone_from_slice(signature_slice))
+    }
+
+    pub fn new_unique() -> Self {
+        Self::from(std::array::from_fn(|_| rand::random()))
     }
 
     pub(self) fn verify_verbose(
@@ -87,6 +96,31 @@ impl From<Signature> for [u8; 64] {
     }
 }
 
+impl From<[u8; SIGNATURE_BYTES]> for Signature {
+    #[inline]
+    fn from(signature: [u8; SIGNATURE_BYTES]) -> Self {
+        Self(GenericArray::from(signature))
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for Signature {
+    type Error = <[u8; SIGNATURE_BYTES] as TryFrom<&'a [u8]>>::Error;
+
+    #[inline]
+    fn try_from(signature: &'a [u8]) -> Result<Self, Self::Error> {
+        <[u8; SIGNATURE_BYTES]>::try_from(signature).map(Self::from)
+    }
+}
+
+impl TryFrom<Vec<u8>> for Signature {
+    type Error = <[u8; SIGNATURE_BYTES] as TryFrom<Vec<u8>>>::Error;
+
+    #[inline]
+    fn try_from(signature: Vec<u8>) -> Result<Self, Self::Error> {
+        <[u8; SIGNATURE_BYTES]>::try_from(signature).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseSignatureError {
     #[error("string decoded to wrong size for signature")]
@@ -105,11 +139,7 @@ impl FromStr for Signature {
         let bytes = bs58::decode(s)
             .into_vec()
             .map_err(|_| ParseSignatureError::Invalid)?;
-        if bytes.len() != mem::size_of::<Signature>() {
-            Err(ParseSignatureError::WrongSize)
-        } else {
-            Ok(Signature::new(&bytes))
-        }
+        Signature::try_from(bytes).map_err(|_| ParseSignatureError::WrongSize)
     }
 }
 
@@ -173,7 +203,7 @@ mod tests {
         let off_curve_point = curve25519_dalek::edwards::CompressedEdwardsY(off_curve_bits);
         assert_eq!(off_curve_point.decompress(), None);
 
-        let pubkey = Pubkey::new(&off_curve_bytes);
+        let pubkey = Pubkey::try_from(off_curve_bytes).unwrap();
         let signature = Signature::default();
         // Unfortunately, ed25519-dalek doesn't surface the internal error types that we'd ideally
         // `source()` out of the `SignatureError` returned by `verify_strict()`.  So the best we

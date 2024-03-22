@@ -1,12 +1,18 @@
-use crate::{
-    parse_account_data::{ParsableAccount, ParseAccountError},
-    validator_info,
+use {
+    crate::{
+        parse_account_data::{ParsableAccount, ParseAccountError},
+        validator_info,
+    },
+    bincode::deserialize,
+    serde_json::Value,
+    solana_config_program::{get_config_data, ConfigKeys},
+    solana_sdk::{
+        pubkey::Pubkey,
+        stake::config::{
+            Config as StakeConfig, {self as stake_config},
+        },
+    },
 };
-use bincode::deserialize;
-use serde_json::Value;
-use solana_config_program::{get_config_data, ConfigKeys};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::stake::config::{self as stake_config, Config as StakeConfig};
 
 pub fn parse_config(data: &[u8], pubkey: &Pubkey) -> Result<ConfigAccountType, ParseAccountError> {
     let parsed_account = if pubkey == &stake_config::id() {
@@ -55,13 +61,17 @@ pub enum ConfigAccountType {
     ValidatorInfo(UiConfig<Value>),
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiConfigKey {
     pub pubkey: String,
     pub signer: bool,
 }
 
+#[deprecated(
+    since = "1.16.7",
+    note = "Please use `solana_sdk::stake::state::warmup_cooldown_rate()` instead"
+)]
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiStakeConfig {
@@ -78,7 +88,7 @@ impl From<StakeConfig> for UiStakeConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiConfig<T> {
     pub keys: Vec<UiConfigKey>,
@@ -87,11 +97,10 @@ pub struct UiConfig<T> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::validator_info::ValidatorInfo;
-    use serde_json::json;
-    use solana_config_program::create_config_account;
-    use solana_sdk::account::ReadableAccount;
+    use {
+        super::*, crate::validator_info::ValidatorInfo, serde_json::json,
+        solana_config_program::create_config_account, solana_sdk::account::ReadableAccount,
+    };
 
     #[test]
     fn test_parse_config() {

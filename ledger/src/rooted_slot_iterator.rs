@@ -1,7 +1,8 @@
-use crate::blockstore_db::Result;
-use crate::{blockstore::*, blockstore_meta::SlotMeta};
-use log::*;
-use solana_sdk::clock::Slot;
+use {
+    crate::{blockstore::*, blockstore_db::Result, blockstore_meta::SlotMeta},
+    log::*,
+    solana_sdk::clock::Slot,
+};
 
 pub struct RootedSlotIterator<'a> {
     next_slots: Vec<Slot>,
@@ -76,9 +77,10 @@ impl<'a> Iterator for RootedSlotIterator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::blockstore_processor::fill_blockstore_slot_with_ticks;
-    use solana_sdk::hash::Hash;
+    use {
+        super::*, crate::blockstore_processor::fill_blockstore_slot_with_ticks,
+        solana_sdk::hash::Hash,
+    };
 
     #[test]
     fn test_rooted_slot_iterator() {
@@ -131,7 +133,7 @@ mod tests {
             fill_blockstore_slot_with_ticks(&blockstore, ticks_per_slot, 4, fork_point, fork_hash);
 
         // Set a root
-        blockstore.set_roots(vec![1, 2, 3].iter()).unwrap();
+        blockstore.set_roots([1, 2, 3].iter()).unwrap();
 
         // Trying to get an iterator on a different fork will error
         assert!(RootedSlotIterator::new(4, &blockstore).is_err());
@@ -193,7 +195,7 @@ mod tests {
         }
 
         // Set roots
-        blockstore.set_roots(vec![0, 1, 2, 3].iter()).unwrap();
+        blockstore.set_roots([0, 1, 2, 3].iter()).unwrap();
 
         // Create one post-skip slot at 10, simulating starting from a snapshot
         // at 10

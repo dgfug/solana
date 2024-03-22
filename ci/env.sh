@@ -23,6 +23,9 @@ if [[ -n $CI ]]; then
   elif [[ -n $BUILDKITE ]]; then
     export CI_BRANCH=$BUILDKITE_BRANCH
     export CI_BUILD_ID=$BUILDKITE_BUILD_ID
+    if [[ $BUILDKITE_COMMIT = HEAD ]]; then
+      BUILDKITE_COMMIT="$(git rev-parse HEAD)"
+    fi
     export CI_COMMIT=$BUILDKITE_COMMIT
     export CI_JOB_ID=$BUILDKITE_JOB_ID
     # The standard BUILDKITE_PULL_REQUEST environment variable is always "false" due
@@ -35,7 +38,18 @@ if [[ -n $CI ]]; then
       export CI_BASE_BRANCH=$BUILDKITE_BRANCH
       export CI_PULL_REQUEST=
     fi
-    export CI_OS_NAME=linux
+
+    case "$(uname -s)" in
+    Linux)
+      export CI_OS_NAME=linux
+      ;;
+    Darwin)
+      export CI_OS_NAME=osx
+      ;;
+    *)
+      ;;
+    esac
+
     if [[ -n $BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG ]]; then
       # The solana-secondary pipeline should use the slug of the pipeline that
       # triggered it
@@ -67,10 +81,42 @@ if [[ -n $CI ]]; then
     fi
     export CI_REPO_SLUG=$APPVEYOR_REPO_NAME
     export CI_TAG=$APPVEYOR_REPO_TAG_NAME
+
+  elif [[ $GITHUB_ACTION ]]; then
+    export CI_BUILD_ID=$GITHUB_RUN_ID
+    export CI_JOB_ID=$GITHUB_RUN_NUMBER
+    export CI_REPO_SLUG=$GITHUB_REPOSITORY
+    export CI_BRANCH=$GITHUB_REF_NAME
+
+    CI_COMMIT=$(git rev-parse HEAD)
+    export CI_COMMIT
+
+    CI_TAG=$(git tag --points-at HEAD)
+    export CI_TAG
+
+    if [[ $GITHUB_BASE_REF ]]; then
+      export CI_BASE_BRANCH=$GITHUB_BASE_REF
+      export CI_PULL_REQUEST=true
+    fi
+
+    case $RUNNER_OS in
+    macOS)
+      export CI_OS_NAME=osx
+      ;;
+    Windows)
+      export CI_OS_NAME=windows
+      ;;
+    Linux)
+      export CI_OS_NAME=linux
+      ;;
+    *)
+      ;;
+    esac
   fi
 else
   export CI=
   export CI_BRANCH=
+  export CI_BASE_BRANCH=
   export CI_BUILD_ID=
   export CI_COMMIT=
   export CI_JOB_ID=
@@ -86,10 +132,12 @@ fi
 cat <<EOF
 CI=$CI
 CI_BRANCH=$CI_BRANCH
+CI_BASE_BRANCH=$CI_BASE_BRANCH
 CI_BUILD_ID=$CI_BUILD_ID
 CI_COMMIT=$CI_COMMIT
 CI_JOB_ID=$CI_JOB_ID
-CI_OS_NAME=$CI_OS_NAME
 CI_PULL_REQUEST=$CI_PULL_REQUEST
+CI_OS_NAME=$CI_OS_NAME
+CI_REPO_SLUG=$CI_REPO_SLUG
 CI_TAG=$CI_TAG
 EOF

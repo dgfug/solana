@@ -1,20 +1,24 @@
-use crate::{
-    parse_account_data::{ParsableAccount, ParseAccountError},
-    StringAmount, UiFeeCalculator,
-};
-use bincode::deserialize;
-use bv::BitVec;
 #[allow(deprecated)]
 use solana_sdk::sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
-use solana_sdk::{
-    clock::{Clock, Epoch, Slot, UnixTimestamp},
-    epoch_schedule::EpochSchedule,
-    pubkey::Pubkey,
-    rent::Rent,
-    slot_hashes::SlotHashes,
-    slot_history::{self, SlotHistory},
-    stake_history::{StakeHistory, StakeHistoryEntry},
-    sysvar::{self, rewards::Rewards},
+use {
+    crate::{
+        parse_account_data::{ParsableAccount, ParseAccountError},
+        StringAmount, UiFeeCalculator,
+    },
+    bincode::deserialize,
+    bv::BitVec,
+    solana_sdk::{
+        clock::{Clock, Epoch, Slot, UnixTimestamp},
+        epoch_schedule::EpochSchedule,
+        pubkey::Pubkey,
+        rent::Rent,
+        slot_hashes::SlotHashes,
+        slot_history::{self, SlotHistory},
+        stake_history::{StakeHistory, StakeHistoryEntry},
+        sysvar::{
+            self, epoch_rewards::EpochRewards, last_restart_slot::LastRestartSlot, rewards::Rewards,
+        },
+    },
 };
 
 pub fn parse_sysvar(data: &[u8], pubkey: &Pubkey) -> Result<SysvarAccountType, ParseAccountError> {
@@ -38,7 +42,7 @@ pub fn parse_sysvar(data: &[u8], pubkey: &Pubkey) -> Result<SysvarAccountType, P
                         .iter()
                         .map(|entry| UiRecentBlockhashesEntry {
                             blockhash: entry.blockhash.to_string(),
-                            fee_calculator: entry.fee_calculator.clone().into(),
+                            fee_calculator: entry.fee_calculator.into(),
                         })
                         .collect();
                     SysvarAccountType::RecentBlockhashes(recent_blockhashes)
@@ -80,6 +84,17 @@ pub fn parse_sysvar(data: &[u8], pubkey: &Pubkey) -> Result<SysvarAccountType, P
                     .collect();
                 SysvarAccountType::StakeHistory(stake_history)
             })
+        } else if pubkey == &sysvar::last_restart_slot::id() {
+            deserialize::<LastRestartSlot>(data)
+                .ok()
+                .map(|last_restart_slot| {
+                    let last_restart_slot = last_restart_slot.last_restart_slot;
+                    SysvarAccountType::LastRestartSlot(UiLastRestartSlot { last_restart_slot })
+                })
+        } else if pubkey == &sysvar::epoch_rewards::id() {
+            deserialize::<EpochRewards>(data)
+                .ok()
+                .map(SysvarAccountType::EpochRewards)
         } else {
             None
         }
@@ -103,9 +118,11 @@ pub enum SysvarAccountType {
     SlotHashes(Vec<UiSlotHashEntry>),
     SlotHistory(UiSlotHistory),
     StakeHistory(Vec<UiStakeHistoryEntry>),
+    LastRestartSlot(UiLastRestartSlot),
+    EpochRewards(EpochRewards),
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UiClock {
     pub slot: Slot,
@@ -127,7 +144,7 @@ impl From<Clock> for UiClock {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UiFees {
     pub fee_calculator: UiFeeCalculator,
@@ -173,21 +190,21 @@ impl From<Rewards> for UiRewards {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiRecentBlockhashesEntry {
     pub blockhash: String,
     pub fee_calculator: UiFeeCalculator,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiSlotHashEntry {
     pub slot: Slot,
     pub hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiSlotHistory {
     pub next_slot: Slot,
@@ -209,19 +226,27 @@ impl std::fmt::Debug for SlotHistoryBits {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UiStakeHistoryEntry {
     pub epoch: Epoch,
     pub stake_history: StakeHistoryEntry,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiLastRestartSlot {
+    pub last_restart_slot: Slot,
+}
+
 #[cfg(test)]
 mod test {
-    use super::*;
     #[allow(deprecated)]
     use solana_sdk::sysvar::recent_blockhashes::IterItem;
-    use solana_sdk::{account::create_account_for_test, fee_calculator::FeeCalculator, hash::Hash};
+    use {
+        super::*,
+        solana_sdk::{account::create_account_for_test, fee_calculator::FeeCalculator, hash::Hash},
+    };
 
     #[test]
     fn test_parse_sysvars() {
@@ -254,12 +279,8 @@ mod test {
                 SysvarAccountType::Fees(UiFees::default()),
             );
 
-            let fee_calculator = FeeCalculator {
-                lamports_per_signature: 10,
-            };
-            let recent_blockhashes: RecentBlockhashes = vec![IterItem(0, &hash, &fee_calculator)]
-                .into_iter()
-                .collect();
+            let recent_blockhashes: RecentBlockhashes =
+                vec![IterItem(0, &hash, 10)].into_iter().collect();
             let recent_blockhashes_sysvar = create_account_for_test(&recent_blockhashes);
             assert_eq!(
                 parse_sysvar(
@@ -269,7 +290,7 @@ mod test {
                 .unwrap(),
                 SysvarAccountType::RecentBlockhashes(vec![UiRecentBlockhashesEntry {
                     blockhash: hash.to_string(),
-                    fee_calculator: fee_calculator.into(),
+                    fee_calculator: FeeCalculator::new(10).into(),
                 }]),
             );
         }
@@ -334,5 +355,31 @@ mod test {
 
         let bad_data = vec![0; 4];
         assert!(parse_sysvar(&bad_data, &sysvar::stake_history::id()).is_err());
+
+        let last_restart_slot = LastRestartSlot {
+            last_restart_slot: 1282,
+        };
+        let last_restart_slot_account = create_account_for_test(&last_restart_slot);
+        assert_eq!(
+            parse_sysvar(
+                &last_restart_slot_account.data,
+                &sysvar::last_restart_slot::id()
+            )
+            .unwrap(),
+            SysvarAccountType::LastRestartSlot(UiLastRestartSlot {
+                last_restart_slot: 1282
+            })
+        );
+
+        let epoch_rewards = EpochRewards {
+            total_rewards: 100,
+            distributed_rewards: 20,
+            distribution_complete_block_height: 42,
+        };
+        let epoch_rewards_sysvar = create_account_for_test(&epoch_rewards);
+        assert_eq!(
+            parse_sysvar(&epoch_rewards_sysvar.data, &sysvar::epoch_rewards::id()).unwrap(),
+            SysvarAccountType::EpochRewards(epoch_rewards),
+        );
     }
 }

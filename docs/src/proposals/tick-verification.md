@@ -18,12 +18,12 @@ number of hashes.
 
 Malicious transmissions `T` are handled in two ways:
 
-1. If a leader can generate some erronenous transmission `T` and also some
+1. If a leader can generate some erroneous transmission `T` and also some
    alternate transmission `T'` for the same slot without violating any slashing
    rules for duplicate transmissions (for instance if `T'` is a subset of `T`),
    then the cluster must handle the possibility of both transmissions being live.
 
-Thus this means we cannot mark the erronenous transmission `T` as dead because
+Thus this means we cannot mark the erroneous transmission `T` as dead because
 the cluster may have reached consensus on `T'`. These cases necessitate a
 slashing proof to punish this bad behavior.
 
@@ -50,7 +50,7 @@ When blockstore receives a new shred `s`, there are two cases:
 
 1. Replay stage replays entries from blockstore, keeping track of the number of
    ticks it has seen per slot, and verifying there are `hashes_per_tick` number of
-   hashes between ticcks. After the tick from this last shred has been played,
+   hashes between ticks. After the tick from this last shred has been played,
    replay stage then checks the total number of ticks.
 
 Failure scenario 1: If ever there are two consecutive ticks between which the

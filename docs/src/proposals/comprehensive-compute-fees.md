@@ -27,7 +27,7 @@ the transaction.  By calculating the total cost of the transaction, the runtime
 can charge a more representative fee and make better transaction scheduling
 decisions.
 
-A fee will be calculated based on:
+A fee could be calculated based on:
 
 1. Number of signatures
    - Fixed rate per signature
@@ -35,7 +35,7 @@ A fee will be calculated based on:
    - Fixed rate per writable account
 3. Data byte cost
    - Fixed rate per byte of the sum of the length all a transactions instruction
-     datas
+     data
 4. Account sizes
    - Account sizes can't be known up-front but can account for a considerable
      amount of the load the transaction incurs on the network.  The payer will
@@ -50,7 +50,7 @@ A fee will be calculated based on:
      requested amount.  After processing, the actual number of units consumed
      will be known, and the payer will be refunded the difference, so the payer
      only pays for what they used.  Builtin programs will have a fixed cost
-     while BPF program's cost will be measured at runtime.
+     while SBF program's cost will be measured at runtime.
 6. Precompiled programs
    - Precompiled programs are performing compute-intensive operations.  The work
      incurred by a precompiled program is predictable based on the instruction's
@@ -77,17 +77,6 @@ takes within a slot to process.
 
 https://github.com/solana-labs/solana/issues/20511
 
-### Transaction-wide compute caps
-
-The current compute budget caps are independently applied to each instruction
-within a transaction. This means the overall transaction cap varies depending on
-how many instructions are in the transaction.  To more accurately schedule a
-transaction, the compute budget will be applied transaction-wide.  One challenge
-of the transaction-wide cap is that each instruction (program) can no longer
-expect to be given an equal amount of compute units.  Each instruction will be
-given the remaining units left over after processing earlier instructions.  This
-will provide some additional tuning and composability challenges for developers.
-
 ### Requestable compute budget caps and heap sizes
 
 The precompiled
@@ -102,7 +91,7 @@ https://github.com/solana-labs/solana/issues/20481
 
 ### Rate governing
 
-Current rate governing needs to be re-assessed.  Current fees are being rate
+Current rate governing needs to be re-assessed.  Fees are being rate
 governed down to their minimums because the number of signatures in each slot is
 far lower than the "target" signatures per slot.
 
@@ -112,21 +101,53 @@ sit at a target rate and only increase if the load goes above a specified but to
 be determined threshold.  The governing will be applied across all the fee
 criteria.
 
-### How do clients calculate a transaction's fee
+### Deterministic fees
 
-Transaction fees are currently calculated based on a fixed cost per signature
-and implemented via an object in the SDK that took a transaction and returned a
-cost.   This object is looked up via a blockhash and returned via RPC to
-calculate the fee offline.
+Solana's fees are currently deterministic based on a given blockhash.  This
+determinism is a nice feature that simplifies client interactions.  An example
+is when draining an account that is also the payer, the transaction issuer can
+pre-compute the fee and then set the entire remaining balance to be transferred
+out without worrying that the fee will change leaving a very small amount
+remaining in the account.  Another example is for offline signing, the payer
+signer can guarantee what fee that will be charged for the transaction based on
+the nonce's blockhash.
 
-The comprehensive fee calculations are more sophisticated and depend on a
-greater amount of information (recent program compute meter measurements).  To
-move to the new fee structure the RPC APIs that return a FeeCalculator object
-will be deprecated, and clients will send their transactions over RPC and be
-returned the calculated fee.
+Determinism is achieved in two ways:
+- blockhash queue contains a list of recent (<=~2min) blockhashes and a
+  `lamports_per_signature` value.  The blockhash queue is one of the snapshot's
+  serialized members and thus bank hash depends on it.
+- Nonce accounts used for offline signing contain a `lamports_per_signature`
+  value in its account data
 
-Fees will no longer be calculated based on a blockhash since it is
-cost-prohibitive to retain the fee cost inputs for each bank (program units,
-account sizes).  And mainly, the governed fee is based on network load now, not
-at some time in the past. This will mean that during offline-signing the actual
-fee charged will not be known until the transaction is submitted.
+In both cases, when a transaction is assessed a fee, the
+`lamports_per_signature` to use is looked up (either in the queue or in the
+nonce account's data) using the transaction's blockhash.
+
+This currently comes with the following challenges:
+- Exposing the `FeeCalculator` object to the clients (holds the
+  `lamports_per_signature`) makes it hard to evolve the fee criteria due to
+  backward-compatibility.  This issue is being solved by deprecating the
+  `FeeCalculator` object and instead the new apis take a message and return a
+  fee.
+- Blockhash queue entries contain the fee criteria specifics and are part of the
+  bankhash so evolving the fees over time involves more work/risk
+- Nonce accounts store the fee criteria directly in their account data so
+  evolving the fees over time requires changes to nonce account data and data
+  size.
+
+Two solutions to the latter two challenges
+- Get rid of the concept of deterministic fees.  Clients ask via RPC to
+  calculate the current fee estimate and the actual fee is assessed when the
+  transaction is processed.  Fee changes will be governed and change slowly
+  based on network load so the fee differences will be small within the 2min
+  window.  Nonce accounts no longer store the fee criteria but instead a fee
+  cap.  If the assessed fee at the time of processing exceeds the cap then the
+  transaction fails.  This solution removes fee criteria entirely from the
+  blockhash queue and nonce accounts and removes the need for either of those to
+  evolve if there is a need for fee criteria to evolve.
+- Retain the concept of deterministic fees.  Clients ask via RPC to calculate
+  the current fee and pass in a blockhash that fee will be associated with.
+  Blockhash queue and nonce accounts switch to a versioned but internal "Fee"
+  object (similar to "FeeCalculator").  Each time there is a need for fees to
+  evolve the fee object will add a new version and new blockhash queue entries
+  and new nonce accounts will use the new version.

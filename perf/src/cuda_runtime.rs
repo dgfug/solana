@@ -5,49 +5,48 @@
 //    copies from host memory to GPU memory unless the memory is page-pinned and
 //    cannot be paged to disk. The cuda driver provides these interfaces to pin and unpin memory.
 
-use crate::perf_libs;
-use crate::recycler::{RecyclerX, Reset};
-use rand::seq::SliceRandom;
-use rand::Rng;
-use rayon::prelude::*;
-use std::ops::{Index, IndexMut};
-use std::slice::{Iter, IterMut, SliceIndex};
-use std::sync::Weak;
-
-use std::os::raw::c_int;
+use {
+    crate::{
+        perf_libs,
+        recycler::{RecyclerX, Reset},
+    },
+    rand::{seq::SliceRandom, Rng},
+    rayon::prelude::*,
+    serde::{Deserialize, Serialize},
+    std::{
+        ops::{Index, IndexMut},
+        os::raw::c_int,
+        slice::{Iter, IterMut, SliceIndex},
+        sync::Weak,
+    },
+};
 
 const CUDA_SUCCESS: c_int = 0;
 
-fn pin<T>(_mem: &mut Vec<T>) {
+fn pin<T>(mem: &mut Vec<T>) {
     if let Some(api) = perf_libs::api() {
-        use std::ffi::c_void;
-        use std::mem::size_of;
+        use std::{ffi::c_void, mem::size_of};
 
-        let ptr = _mem.as_mut_ptr();
-        let size = _mem.capacity().saturating_mul(size_of::<T>());
+        let ptr = mem.as_mut_ptr();
+        let size = mem.capacity().saturating_mul(size_of::<T>());
         let err = unsafe {
             (api.cuda_host_register)(ptr as *mut c_void, size, /*flags=*/ 0)
         };
         assert!(
             err == CUDA_SUCCESS,
-            "cudaHostRegister error: {} ptr: {:?} bytes: {}",
-            err,
-            ptr,
-            size
+            "cudaHostRegister error: {err} ptr: {ptr:?} bytes: {size}"
         );
     }
 }
 
-fn unpin<T>(_mem: *mut T) {
+fn unpin<T>(mem: *mut T) {
     if let Some(api) = perf_libs::api() {
         use std::ffi::c_void;
 
-        let err = unsafe { (api.cuda_host_unregister)(_mem as *mut c_void) };
+        let err = unsafe { (api.cuda_host_unregister)(mem as *mut c_void) };
         assert!(
             err == CUDA_SUCCESS,
-            "cudaHostUnregister returned: {} ptr: {:?}",
-            err,
-            _mem
+            "cudaHostUnregister returned: {err} ptr: {mem:?}"
         );
     }
 }
@@ -55,11 +54,12 @@ fn unpin<T>(_mem: *mut T) {
 // A vector wrapper where the underlying memory can be
 // page-pinned. Controlled by flags in case user only wants
 // to pin in certain circumstances.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize, AbiExample)]
 pub struct PinnedVec<T: Default + Clone + Sized> {
     x: Vec<T>,
     pinned: bool,
     pinnable: bool,
+    #[serde(skip)]
     recycler: Weak<RecyclerX<PinnedVec<T>>>,
 }
 
@@ -250,25 +250,48 @@ impl<T: Clone + Default + Sized> PinnedVec<T> {
         self.check_ptr(old_ptr, old_capacity, "resize");
     }
 
+    /// Forces the length of the vector to `new_len`.
+    ///
+    /// This is a low-level operation that maintains none of the normal
+    /// invariants of the type. Normally changing the length of a vector
+    /// is done using one of the safe operations instead, such as
+    /// [`truncate`], [`resize`], [`extend`], or [`clear`].
+    ///
+    /// [`truncate`]: Vec::truncate
+    /// [`resize`]: Vec::resize
+    /// [`extend`]: Extend::extend
+    /// [`clear`]: Vec::clear
+    ///
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to [`capacity()`].
+    /// - The elements at `old_len..new_len` must be initialized.
+    ///
+    /// [`capacity()`]: Vec::capacity
+    ///
+    pub unsafe fn set_len(&mut self, size: usize) {
+        self.x.set_len(size);
+    }
+
     pub fn shuffle<R: Rng>(&mut self, rng: &mut R) {
         self.x.shuffle(rng)
     }
 
-    fn check_ptr(&mut self, _old_ptr: *mut T, _old_capacity: usize, _from: &'static str) {
+    fn check_ptr(&mut self, old_ptr: *mut T, old_capacity: usize, from: &'static str) {
         let api = perf_libs::api();
         if api.is_some()
             && self.pinnable
-            && (self.x.as_ptr() != _old_ptr || self.x.capacity() != _old_capacity)
+            && (self.x.as_ptr() != old_ptr || self.x.capacity() != old_capacity)
         {
             if self.pinned {
-                unpin(_old_ptr);
+                unpin(old_ptr);
             }
 
             trace!(
                 "pinning from check_ptr old: {} size: {} from: {}",
-                _old_capacity,
+                old_capacity,
                 self.x.capacity(),
-                _from
+                from
             );
             pin(&mut self.x);
             self.pinned = true;

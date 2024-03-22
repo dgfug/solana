@@ -1,5 +1,7 @@
+#![allow(clippy::to_string_in_format_args)]
 use {
     crate::{
+        cli_version::CliVersion,
         display::{
             build_balance_message, build_balance_message_with_config, format_labeled_address,
             unix_timestamp_to_string, writeln_name_value, writeln_transaction,
@@ -7,19 +9,24 @@ use {
         },
         QuietDisplay, VerboseDisplay,
     },
-    chrono::{Local, TimeZone},
+    base64::{prelude::BASE64_STANDARD, Engine},
+    chrono::{Local, TimeZone, Utc},
     clap::ArgMatches,
     console::{style, Emoji},
     inflector::cases::titlecase::to_title_case,
     serde::{Deserialize, Serialize},
     serde_json::{Map, Value},
-    solana_account_decoder::parse_token::UiTokenAccount,
+    solana_account_decoder::{
+        parse_account_data::AccountAdditionalData, parse_token::UiTokenAccount, UiAccount,
+        UiAccountEncoding, UiDataSliceConfig,
+    },
     solana_clap_utils::keypair::SignOnly,
-    solana_client::rpc_response::{
+    solana_rpc_client_api::response::{
         RpcAccountBalance, RpcContactInfo, RpcInflationGovernor, RpcInflationRate, RpcKeyedAccount,
         RpcSupply, RpcVoteAccountInfo,
     },
     solana_sdk::{
+        account::ReadableAccount,
         clock::{Epoch, Slot, UnixTimestamp},
         epoch_info::EpochInfo,
         hash::Hash,
@@ -28,7 +35,7 @@ use {
         signature::Signature,
         stake::state::{Authorized, Lockup},
         stake_history::StakeHistoryEntry,
-        transaction::{Transaction, TransactionError},
+        transaction::{Transaction, TransactionError, VersionedTransaction},
     },
     solana_transaction_status::{
         EncodedConfirmedBlock, EncodedTransaction, TransactionConfirmationStatus,
@@ -36,7 +43,7 @@ use {
     },
     solana_vote_program::{
         authorized_voters::AuthorizedVoters,
-        vote_state::{BlockTimestamp, Lockout, MAX_EPOCH_CREDITS_HISTORY, MAX_LOCKOUT_HISTORY},
+        vote_state::{BlockTimestamp, LandedVote, MAX_EPOCH_CREDITS_HISTORY, MAX_LOCKOUT_HISTORY},
     },
     std::{
         collections::{BTreeMap, HashMap},
@@ -46,9 +53,11 @@ use {
     },
 };
 
+static CHECK_MARK: Emoji = Emoji("✅ ", "");
+static CROSS_MARK: Emoji = Emoji("❌ ", "");
 static WARNING: Emoji = Emoji("⚠️", "!");
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
     Display,
     Json,
@@ -63,7 +72,7 @@ impl OutputFormat {
         T: Serialize + fmt::Display + QuietDisplay + VerboseDisplay,
     {
         match self {
-            OutputFormat::Display => format!("{}", item),
+            OutputFormat::Display => format!("{item}"),
             OutputFormat::DisplayQuiet => {
                 let mut s = String::new();
                 QuietDisplay::write_str(item, &mut s).unwrap();
@@ -99,8 +108,65 @@ impl OutputFormat {
 pub struct CliAccount {
     #[serde(flatten)]
     pub keyed_account: RpcKeyedAccount,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, skip_deserializing)]
     pub use_lamports_unit: bool,
+}
+
+pub struct CliAccountNewConfig {
+    pub data_encoding: UiAccountEncoding,
+    pub additional_data: Option<AccountAdditionalData>,
+    pub data_slice_config: Option<UiDataSliceConfig>,
+    pub use_lamports_unit: bool,
+}
+
+impl Default for CliAccountNewConfig {
+    fn default() -> Self {
+        Self {
+            data_encoding: UiAccountEncoding::Base64,
+            additional_data: None,
+            data_slice_config: None,
+            use_lamports_unit: false,
+        }
+    }
+}
+
+impl CliAccount {
+    pub fn new<T: ReadableAccount>(address: &Pubkey, account: &T, use_lamports_unit: bool) -> Self {
+        Self::new_with_config(
+            address,
+            account,
+            &CliAccountNewConfig {
+                use_lamports_unit,
+                ..CliAccountNewConfig::default()
+            },
+        )
+    }
+
+    pub fn new_with_config<T: ReadableAccount>(
+        address: &Pubkey,
+        account: &T,
+        config: &CliAccountNewConfig,
+    ) -> Self {
+        let CliAccountNewConfig {
+            data_encoding,
+            additional_data,
+            data_slice_config,
+            use_lamports_unit,
+        } = *config;
+        Self {
+            keyed_account: RpcKeyedAccount {
+                pubkey: address.to_string(),
+                account: UiAccount::encode(
+                    address,
+                    account,
+                    data_encoding,
+                    additional_data,
+                    data_slice_config,
+                ),
+            },
+            use_lamports_unit,
+        }
+    }
 }
 
 impl QuietDisplay for CliAccount {}
@@ -158,12 +224,8 @@ impl fmt::Display for CliBlockProduction {
             f,
             "{}",
             style(format!(
-                "  {:<44}  {:>15}  {:>15}  {:>15}  {:>23}",
-                "Identity",
-                "Leader Slots",
-                "Blocks Produced",
-                "Skipped Slots",
-                "Skipped Slot Percentage",
+                "  {:<44}  {:>15}  {:>15}  {:>15}  {:>15}",
+                "Identity", "Leader Slots", "Blocks Produced", "Skipped Slots", "Skip Rate",
             ))
             .bold()
         )?;
@@ -247,6 +309,7 @@ pub struct CliSlotStatus {
 pub struct CliEpochInfo {
     #[serde(flatten)]
     pub epoch_info: EpochInfo,
+    pub epoch_completed_percent: f64,
     #[serde(skip)]
     pub average_slot_time_ms: u64,
     #[serde(skip)]
@@ -276,15 +339,12 @@ impl fmt::Display for CliEpochInfo {
         writeln_name_value(
             f,
             "Epoch Slot Range:",
-            &format!("[{}..{})", start_slot, end_slot),
+            &format!("[{start_slot}..{end_slot})"),
         )?;
         writeln_name_value(
             f,
             "Epoch Completed Percent:",
-            &format!(
-                "{:>3.3}%",
-                self.epoch_info.slot_index as f64 / self.epoch_info.slots_in_epoch as f64 * 100_f64
-            ),
+            &format!("{:>3.3}%", self.epoch_completed_percent),
         )?;
         let remaining_slots_in_epoch = self.epoch_info.slots_in_epoch - self.epoch_info.slot_index;
         writeln_name_value(
@@ -316,15 +376,15 @@ impl fmt::Display for CliEpochInfo {
             "Epoch Completed Time:",
             &format!(
                 "{}{}/{} ({} remaining)",
-                humantime::format_duration(time_elapsed).to_string(),
+                humantime::format_duration(time_elapsed),
                 if annotation.is_some() { "*" } else { "" },
-                humantime::format_duration(time_elapsed + time_remaining).to_string(),
-                humantime::format_duration(time_remaining).to_string(),
+                humantime::format_duration(time_elapsed + time_remaining),
+                humantime::format_duration(time_remaining),
             ),
         )?;
         if let Some(annotation) = annotation {
             writeln!(f)?;
-            writeln!(f, "{}", annotation)?;
+            writeln!(f, "{annotation}")?;
         }
         Ok(())
     }
@@ -343,7 +403,7 @@ pub struct CliValidatorsStakeByVersion {
     pub delinquent_active_stake: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CliValidatorsSortOrder {
     Delinquent,
     Commission,
@@ -354,6 +414,7 @@ pub enum CliValidatorsSortOrder {
     SkipRate,
     Stake,
     VoteAccount,
+    Version,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -371,7 +432,7 @@ pub struct CliValidators {
     pub validators_reverse_sort: bool,
     #[serde(skip_serializing)]
     pub number_validators: bool,
-    pub stake_by_version: BTreeMap<String, CliValidatorsStakeByVersion>,
+    pub stake_by_version: BTreeMap<CliVersion, CliValidatorsStakeByVersion>,
     #[serde(skip_serializing)]
     pub use_lamports_unit: bool,
 }
@@ -391,19 +452,19 @@ impl fmt::Display for CliValidators {
         ) -> fmt::Result {
             fn non_zero_or_dash(v: u64, max_v: u64) -> String {
                 if v == 0 {
-                    "-         ".into()
+                    "        -      ".into()
                 } else if v == max_v {
-                    format!("{:>8} (  0)", v)
+                    format!("{v:>9} (  0)")
                 } else if v > max_v.saturating_sub(100) {
-                    format!("{:>8} ({:>3})", v, -(max_v.saturating_sub(v) as isize))
+                    format!("{:>9} ({:>3})", v, -(max_v.saturating_sub(v) as isize))
                 } else {
-                    format!("{:>8}      ", v)
+                    format!("{v:>9}      ")
                 }
             }
 
             writeln!(
                 f,
-                "{} {:<44}  {:<44}  {:>3}%  {:>14}  {:>14} {:>7} {:>8}  {:>7}  {}",
+                "{} {:<44}  {:<44}  {:>3}%  {:>14}  {:>14} {:>7} {:>8}  {:>7}  {:>22} ({:.2}%)",
                 if validator.delinquent {
                     WARNING.to_string()
                 } else {
@@ -415,21 +476,22 @@ impl fmt::Display for CliValidators {
                 non_zero_or_dash(validator.last_vote, highest_last_vote),
                 non_zero_or_dash(validator.root_slot, highest_root),
                 if let Some(skip_rate) = validator.skip_rate {
-                    format!("{:.2}%", skip_rate)
+                    format!("{skip_rate:.2}%")
                 } else {
-                    "- ".to_string()
+                    "-   ".to_string()
                 },
                 validator.epoch_credits,
-                validator.version,
-                if validator.activated_stake > 0 {
-                    format!(
-                        "{} ({:.2}%)",
-                        build_balance_message(validator.activated_stake, use_lamports_unit, true),
-                        100. * validator.activated_stake as f64 / total_active_stake as f64,
-                    )
-                } else {
-                    "-".into()
-                },
+                // convert to a string so that fill/alignment works correctly
+                validator.version.to_string(),
+                build_balance_message_with_config(
+                    validator.activated_stake,
+                    &BuildBalanceMessageConfig {
+                        use_lamports_unit,
+                        trim_trailing_zeros: false,
+                        ..BuildBalanceMessageConfig::default()
+                    }
+                ),
+                100. * validator.activated_stake as f64 / total_active_stake as f64,
             )
         }
 
@@ -439,21 +501,21 @@ impl fmt::Display for CliValidators {
             0
         };
         let header = style(format!(
-            "{:padding$} {:<44}  {:<38}  {}  {}  {} {}  {}  {}  {}",
+            "{:padding$} {:<44}  {:<38}  {}  {}  {} {}  {}  {}  {:>22}",
             " ",
             "Identity",
             "Vote Account",
             "Commission",
-            "Last Vote     ",
-            "Root Slot   ",
+            "Last Vote      ",
+            "Root Slot    ",
             "Skip Rate",
             "Credits",
             "Version",
             "Active Stake",
-            padding = padding + 1
+            padding = padding + 2
         ))
         .bold();
-        writeln!(f, "{}", header)?;
+        writeln!(f, "{header}")?;
 
         let mut sorted_validators = self.validators.clone();
         match self.validators_sort_order {
@@ -492,6 +554,11 @@ impl fmt::Display for CliValidators {
             CliValidatorsSortOrder::Stake => {
                 sorted_validators.sort_by_key(|a| a.activated_stake);
             }
+            CliValidatorsSortOrder::Version => {
+                sorted_validators.sort_by(|a, b| {
+                    (&a.version, a.activated_stake).cmp(&(&b.version, b.activated_stake))
+                });
+            }
         }
 
         if self.validators_reverse_sort {
@@ -511,7 +578,12 @@ impl fmt::Display for CliValidators {
 
         for (i, validator) in sorted_validators.iter().enumerate() {
             if padding > 0 {
-                write!(f, "{:padding$}", i + 1, padding = padding)?;
+                let num = if self.validators_reverse_sort {
+                    i + 1
+                } else {
+                    sorted_validators.len() - i
+                };
+                write!(f, "{num:padding$} ")?;
             }
             write_vote_account(
                 f,
@@ -525,7 +597,7 @@ impl fmt::Display for CliValidators {
 
         // The actual header has long scrolled away.  Print the header once more as a footer
         if self.validators.len() > 100 {
-            writeln!(f, "{}", header)?;
+            writeln!(f, "{header}")?;
         }
 
         writeln!(f)?;
@@ -573,16 +645,17 @@ impl fmt::Display for CliValidators {
 
         writeln!(f)?;
         writeln!(f, "{}", style("Stake By Version:").bold())?;
-        for (version, info) in self.stake_by_version.iter() {
+        for (version, info) in self.stake_by_version.iter().rev() {
             writeln!(
                 f,
-                "{:<8} - {:4} current validators ({:>5.2}%){}",
-                version,
+                "{:<7} - {:4} current validators ({:>5.2}%){}",
+                // convert to a string so that fill/alignment works correctly
+                version.to_string(),
                 info.current_validators,
                 100. * info.current_active_stake as f64 / self.total_active_stake as f64,
                 if info.delinquent_validators > 0 {
                     format!(
-                        ", {:3} delinquent validators ({:>5.2}%)",
+                        " {:3} delinquent validators ({:>5.2}%)",
                         info.delinquent_validators,
                         100. * info.delinquent_active_stake as f64 / self.total_active_stake as f64
                     )
@@ -607,7 +680,7 @@ pub struct CliValidator {
     pub credits: u64,       // lifetime credits
     pub epoch_credits: u64, // credits earned in the current epoch
     pub activated_stake: u64,
-    pub version: String,
+    pub version: CliVersion,
     pub delinquent: bool,
     pub skip_rate: Option<f64>,
 }
@@ -616,7 +689,7 @@ impl CliValidator {
     pub fn new(
         vote_account: &RpcVoteAccountInfo,
         current_epoch: Epoch,
-        version: String,
+        version: CliVersion,
         skip_rate: Option<f64>,
         address_labels: &HashMap<String, String>,
     ) -> Self {
@@ -633,7 +706,7 @@ impl CliValidator {
     pub fn new_delinquent(
         vote_account: &RpcVoteAccountInfo,
         current_epoch: Epoch,
-        version: String,
+        version: CliVersion,
         skip_rate: Option<f64>,
         address_labels: &HashMap<String, String>,
     ) -> Self {
@@ -650,7 +723,7 @@ impl CliValidator {
     fn _new(
         vote_account: &RpcVoteAccountInfo,
         current_epoch: Epoch,
-        version: String,
+        version: CliVersion,
         skip_rate: Option<f64>,
         address_labels: &HashMap<String, String>,
         delinquent: bool,
@@ -679,6 +752,111 @@ impl CliValidator {
             delinquent,
             skip_rate,
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliHistorySignatureVec(Vec<CliHistorySignature>);
+
+impl CliHistorySignatureVec {
+    pub fn new(list: Vec<CliHistorySignature>) -> Self {
+        Self(list)
+    }
+}
+
+impl QuietDisplay for CliHistorySignatureVec {}
+impl VerboseDisplay for CliHistorySignatureVec {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        for signature in &self.0 {
+            VerboseDisplay::write_str(signature, w)?;
+        }
+        writeln!(w, "{} transactions found", self.0.len())
+    }
+}
+
+impl fmt::Display for CliHistorySignatureVec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for signature in &self.0 {
+            write!(f, "{signature}")?;
+        }
+        writeln!(f, "{} transactions found", self.0.len())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CliHistorySignature {
+    pub signature: String,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub verbose: Option<CliHistoryVerbose>,
+}
+
+impl QuietDisplay for CliHistorySignature {}
+impl VerboseDisplay for CliHistorySignature {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        let verbose = self
+            .verbose
+            .as_ref()
+            .expect("should have verbose.is_some()");
+        writeln!(
+            w,
+            "{} [slot={} {}status={}] {}",
+            self.signature,
+            verbose.slot,
+            match verbose.block_time {
+                None => "".to_string(),
+                Some(block_time) => format!("timestamp={} ", unix_timestamp_to_string(block_time)),
+            },
+            if let Some(err) = &verbose.err {
+                format!("Failed: {err:?}")
+            } else {
+                match &verbose.confirmation_status {
+                    None => "Finalized".to_string(),
+                    Some(status) => format!("{status:?}"),
+                }
+            },
+            verbose.memo.clone().unwrap_or_default(),
+        )
+    }
+}
+
+impl fmt::Display for CliHistorySignature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "{}", self.signature)
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CliHistoryVerbose {
+    pub slot: Slot,
+    pub block_time: Option<UnixTimestamp>,
+    pub err: Option<TransactionError>,
+    pub confirmation_status: Option<TransactionConfirmationStatus>,
+    pub memo: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliHistoryTransactionVec(Vec<CliTransactionConfirmation>);
+
+impl CliHistoryTransactionVec {
+    pub fn new(list: Vec<CliTransactionConfirmation>) -> Self {
+        Self(list)
+    }
+}
+
+impl QuietDisplay for CliHistoryTransactionVec {}
+impl VerboseDisplay for CliHistoryTransactionVec {}
+
+impl fmt::Display for CliHistoryTransactionVec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for transaction in &self.0 {
+            VerboseDisplay::write_str(transaction, f)?;
+            writeln!(f)?;
+        }
+        writeln!(f, "{} transactions found", self.0.len())
     }
 }
 
@@ -714,14 +892,14 @@ impl fmt::Display for CliNonceAccount {
             )
         )?;
         let nonce = self.nonce.as_deref().unwrap_or("uninitialized");
-        writeln!(f, "Nonce blockhash: {}", nonce)?;
+        writeln!(f, "Nonce blockhash: {nonce}")?;
         if let Some(fees) = self.lamports_per_signature {
-            writeln!(f, "Fee: {} lamports per signature", fees)?;
+            writeln!(f, "Fee: {fees} lamports per signature")?;
         } else {
             writeln!(f, "Fees: uninitialized")?;
         }
         let authority = self.authority.as_deref().unwrap_or("uninitialized");
-        writeln!(f, "Authority: {}", authority)
+        writeln!(f, "Authority: {authority}")
     }
 }
 
@@ -749,7 +927,7 @@ impl fmt::Display for CliStakeVec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for state in &self.0 {
             writeln!(f)?;
-            write!(f, "{}", state)?;
+            write!(f, "{state}")?;
         }
         Ok(())
     }
@@ -788,6 +966,7 @@ pub struct CliEpochReward {
     pub percent_change: f64,
     pub apr: Option<f64>,
     pub commission: Option<u8>,
+    pub block_time: UnixTimestamp,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -847,11 +1026,11 @@ impl fmt::Display for CliKeyedEpochRewards {
                         reward.percent_change,
                         reward
                             .apr
-                            .map(|apr| format!("{:.2}%", apr))
+                            .map(|apr| format!("{apr:.2}%"))
                             .unwrap_or_default(),
                         reward
                             .commission
-                            .map(|commission| format!("{}%", commission))
+                            .map(|commission| format!("{commission}%"))
                             .unwrap_or_else(|| "-".to_string())
                     )?;
                 }
@@ -866,7 +1045,7 @@ impl fmt::Display for CliKeyedEpochRewards {
 
 fn show_votes_and_credits(
     f: &mut fmt::Formatter,
-    votes: &[CliLockout],
+    votes: &[CliLandedVote],
     epoch_voting_history: &[CliEpochVotingHistory],
 ) -> fmt::Result {
     if votes.is_empty() {
@@ -874,7 +1053,7 @@ fn show_votes_and_credits(
     }
 
     // Existence of this should guarantee the occurrence of vote truncation
-    let newest_history_entry = epoch_voting_history.iter().rev().next();
+    let newest_history_entry = epoch_voting_history.iter().next_back();
 
     writeln!(
         f,
@@ -889,11 +1068,16 @@ fn show_votes_and_credits(
     )?;
 
     for vote in votes.iter().rev() {
-        writeln!(
+        write!(
             f,
             "- slot: {} (confirmation count: {})",
             vote.slot, vote.confirmation_count
         )?;
+        if vote.latency == 0 {
+            writeln!(f)?;
+        } else {
+            writeln!(f, " (latency {})", vote.latency)?;
+        }
     }
     if let Some(newest) = newest_history_entry {
         writeln!(
@@ -948,8 +1132,7 @@ fn show_votes_and_credits(
 
             writeln!(
                 f,
-                "- ... (omitting {} past rooted votes, which have already been credited)",
-                count
+                "- ... (omitting {count} past rooted votes, which have already been credited)"
             )?;
         }
     }
@@ -957,9 +1140,36 @@ fn show_votes_and_credits(
     Ok(())
 }
 
+enum Format {
+    Csv,
+    Human,
+}
+
+macro_rules! format_as {
+    ($target:expr, $fmt1:expr, $fmt2:expr, $which_fmt:expr, $($arg:tt)*) => {
+        match $which_fmt {
+            Format::Csv => {
+                writeln!(
+                    $target,
+                    $fmt1,
+                    $($arg)*
+                )
+            },
+            Format::Human => {
+                writeln!(
+                    $target,
+                    $fmt2,
+                    $($arg)*
+                )
+            }
+        }
+    };
+}
+
 fn show_epoch_rewards(
     f: &mut fmt::Formatter,
     epoch_rewards: &Option<Vec<CliEpochReward>>,
+    use_csv: bool,
 ) -> fmt::Result {
     if let Some(epoch_rewards) = epoch_rewards {
         if epoch_rewards.is_empty() {
@@ -967,27 +1177,40 @@ fn show_epoch_rewards(
         }
 
         writeln!(f, "Epoch Rewards:")?;
-        writeln!(
+        let fmt = if use_csv { Format::Csv } else { Format::Human };
+        format_as!(
             f,
-            "  {:<6}  {:<11}  {:<18}  {:<18}  {:>14}  {:>14}  {:>10}",
-            "Epoch", "Reward Slot", "Amount", "New Balance", "Percent Change", "APR", "Commission"
+            "{},{},{},{},{},{},{},{}",
+            "  {:<6}  {:<11}  {:<26}  {:<18}  {:<18}  {:>14}  {:>14}  {:>10}",
+            fmt,
+            "Epoch",
+            "Reward Slot",
+            "Time",
+            "Amount",
+            "New Balance",
+            "Percent Change",
+            "APR",
+            "Commission",
         )?;
         for reward in epoch_rewards {
-            writeln!(
+            format_as!(
                 f,
-                "  {:<6}  {:<11}  ◎{:<17.9}  ◎{:<17.9}  {:>13.9}%  {:>14}  {:>10}",
+                "{},{},{},{},{},{}%,{},{}",
+                "  {:<6}  {:<11}  {:<26}  ◎{:<17.9}  ◎{:<17.9}  {:>13.3}%  {:>14}  {:>10}",
+                fmt,
                 reward.epoch,
                 reward.effective_slot,
+                Utc.timestamp_opt(reward.block_time, 0).unwrap(),
                 lamports_to_sol(reward.amount),
                 lamports_to_sol(reward.post_balance),
                 reward.percent_change,
                 reward
                     .apr
-                    .map(|apr| format!("{:.2}%", apr))
+                    .map(|apr| format!("{apr:.2}%"))
                     .unwrap_or_default(),
                 reward
                     .commission
-                    .map(|commission| format!("{}%", commission))
+                    .map(|commission| format!("{commission}%"))
                     .unwrap_or_else(|| "-".to_string())
             )?;
         }
@@ -1028,14 +1251,16 @@ pub struct CliStakeState {
     pub deactivating_stake: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch_rewards: Option<Vec<CliEpochReward>>,
+    #[serde(skip_serializing)]
+    pub use_csv: bool,
 }
 
 impl QuietDisplay for CliStakeState {}
 impl VerboseDisplay for CliStakeState {
     fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
-        write!(w, "{}", self)?;
+        write!(w, "{self}")?;
         if let Some(credits) = self.credits_observed {
-            writeln!(w, "Credits Observed: {}", credits)?;
+            writeln!(w, "Credits Observed: {credits}")?;
         }
         Ok(())
     }
@@ -1166,8 +1391,7 @@ impl fmt::Display for CliStakeState {
                         }
                         writeln!(
                             f,
-                            "Stake deactivates starting from epoch: {}",
-                            deactivation_epoch
+                            "Stake deactivates starting from epoch: {deactivation_epoch}"
                         )?;
                     }
                     if let Some(delegated_vote_account_address) =
@@ -1175,8 +1399,7 @@ impl fmt::Display for CliStakeState {
                     {
                         writeln!(
                             f,
-                            "Delegated Vote Account Address: {}",
-                            delegated_vote_account_address
+                            "Delegated Vote Account Address: {delegated_vote_account_address}"
                         )?;
                     }
                 } else {
@@ -1184,14 +1407,14 @@ impl fmt::Display for CliStakeState {
                 }
                 show_authorized(f, self.authorized.as_ref().unwrap())?;
                 show_lockup(f, self.lockup.as_ref())?;
-                show_epoch_rewards(f, &self.epoch_rewards)?
+                show_epoch_rewards(f, &self.epoch_rewards, self.use_csv)?
             }
         }
         Ok(())
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub enum CliStakeType {
     Stake,
     RewardsPool,
@@ -1325,7 +1548,7 @@ impl fmt::Display for CliValidatorInfoVec {
         }
         for validator_info in &self.0 {
             writeln!(f)?;
-            write!(f, "{}", validator_info)?;
+            write!(f, "{validator_info}")?;
         }
         Ok(())
     }
@@ -1357,7 +1580,7 @@ impl fmt::Display for CliValidatorInfo {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliVoteAccount {
     pub account_balance: u64,
@@ -1369,10 +1592,12 @@ pub struct CliVoteAccount {
     pub commission: u8,
     pub root_slot: Option<Slot>,
     pub recent_timestamp: BlockTimestamp,
-    pub votes: Vec<CliLockout>,
+    pub votes: Vec<CliLandedVote>,
     pub epoch_voting_history: Vec<CliEpochVotingHistory>,
     #[serde(skip_serializing)]
     pub use_lamports_unit: bool,
+    #[serde(skip_serializing)]
+    pub use_csv: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch_rewards: Option<Vec<CliEpochReward>>,
 }
@@ -1407,12 +1632,12 @@ impl fmt::Display for CliVoteAccount {
             self.recent_timestamp.slot
         )?;
         show_votes_and_credits(f, &self.votes, &self.epoch_voting_history)?;
-        show_epoch_rewards(f, &self.epoch_rewards)?;
+        show_epoch_rewards(f, &self.epoch_rewards, self.use_csv)?;
         Ok(())
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliAuthorizedVoters {
     authorized_voters: BTreeMap<Epoch, String>,
@@ -1423,7 +1648,23 @@ impl VerboseDisplay for CliAuthorizedVoters {}
 
 impl fmt::Display for CliAuthorizedVoters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self.authorized_voters)
+        if let Some((_epoch, current_authorized_voter)) = self.authorized_voters.first_key_value() {
+            write!(f, "{current_authorized_voter}")?;
+        } else {
+            write!(f, "None")?;
+        }
+        if self.authorized_voters.len() > 1 {
+            let (epoch, upcoming_authorized_voter) = self
+                .authorized_voters
+                .last_key_value()
+                .expect("CliAuthorizedVoters::authorized_voters.len() > 1");
+            writeln!(f)?;
+            write!(
+                f,
+                "  New Vote Authority as of Epoch {epoch}: {upcoming_authorized_voter}"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1451,16 +1692,18 @@ pub struct CliEpochVotingHistory {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CliLockout {
+pub struct CliLandedVote {
+    pub latency: u8,
     pub slot: Slot,
     pub confirmation_count: u32,
 }
 
-impl From<&Lockout> for CliLockout {
-    fn from(lockout: &Lockout) -> Self {
+impl From<&LandedVote> for CliLandedVote {
+    fn from(landed_vote: &LandedVote) -> Self {
         Self {
-            slot: lockout.slot,
-            confirmation_count: lockout.confirmation_count,
+            latency: landed_vote.latency,
+            slot: landed_vote.slot(),
+            confirmation_count: landed_vote.confirmation_count(),
         }
     }
 }
@@ -1588,7 +1831,7 @@ impl fmt::Display for CliInflation {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CliSignOnlyData {
     pub blockhash: String,
@@ -1615,19 +1858,19 @@ impl fmt::Display for CliSignOnlyData {
         if !self.signers.is_empty() {
             writeln!(f, "{}", style("Signers (Pubkey=Signature):").bold())?;
             for signer in self.signers.iter() {
-                writeln!(f, " {}", signer)?;
+                writeln!(f, " {signer}")?;
             }
         }
         if !self.absent.is_empty() {
             writeln!(f, "{}", style("Absent Signers (Pubkey):").bold())?;
             for pubkey in self.absent.iter() {
-                writeln!(f, " {}", pubkey)?;
+                writeln!(f, " {pubkey}")?;
             }
         }
         if !self.bad_sig.is_empty() {
             writeln!(f, "{}", style("Bad Signatures (Pubkey):").bold())?;
             for pubkey in self.bad_sig.iter() {
-                writeln!(f, " {}", pubkey)?;
+                writeln!(f, " {pubkey}")?;
             }
         }
         Ok(())
@@ -1722,7 +1965,7 @@ impl fmt::Display for CliSupply {
             writeln!(f)?;
             writeln_name_value(f, "Non-Circulating Accounts:", " ")?;
             for account in &self.non_circulating_accounts {
-                writeln!(f, "  {}", account)?;
+                writeln!(f, "  {account}")?;
             }
         }
         Ok(())
@@ -1771,7 +2014,7 @@ impl VerboseDisplay for CliFees {}
 impl fmt::Display for CliFees {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.inner.as_ref() {
-            Some(inner) => write!(f, "{}", inner),
+            Some(inner) => write!(f, "{inner}"),
             None => write!(f, "Fees unavailable"),
         }
     }
@@ -1848,6 +2091,7 @@ impl fmt::Display for CliTokenAccount {
 #[serde(rename_all = "camelCase")]
 pub struct CliProgramId {
     pub program_id: String,
+    pub signature: Option<String>,
 }
 
 impl QuietDisplay for CliProgramId {}
@@ -1855,7 +2099,12 @@ impl VerboseDisplay for CliProgramId {}
 
 impl fmt::Display for CliProgramId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln_name_value(f, "Program Id:", &self.program_id)
+        writeln_name_value(f, "Program Id:", &self.program_id)?;
+        if let Some(ref signature) = self.signature {
+            writeln!(f)?;
+            writeln_name_value(f, "Signature:", signature)?;
+        }
+        Ok(())
     }
 }
 
@@ -1917,6 +2166,72 @@ impl fmt::Display for CliProgram {
             "Data Length:",
             &format!("{:?} ({:#x?}) bytes", self.data_len, self.data_len),
         )?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliProgramV4 {
+    pub program_id: String,
+    pub owner: String,
+    pub authority: String,
+    pub last_deploy_slot: u64,
+    pub status: String,
+    pub data_len: usize,
+}
+impl QuietDisplay for CliProgramV4 {}
+impl VerboseDisplay for CliProgramV4 {}
+impl fmt::Display for CliProgramV4 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln_name_value(f, "Program Id:", &self.program_id)?;
+        writeln_name_value(f, "Owner:", &self.owner)?;
+        writeln_name_value(f, "Authority:", &self.authority)?;
+        writeln_name_value(
+            f,
+            "Last Deployed In Slot:",
+            &self.last_deploy_slot.to_string(),
+        )?;
+        writeln_name_value(f, "Status:", &self.status)?;
+        writeln_name_value(
+            f,
+            "Data Length:",
+            &format!("{:?} ({:#x?}) bytes", self.data_len, self.data_len),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliProgramsV4 {
+    pub programs: Vec<CliProgramV4>,
+}
+impl QuietDisplay for CliProgramsV4 {}
+impl VerboseDisplay for CliProgramsV4 {}
+impl fmt::Display for CliProgramsV4 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln!(
+            f,
+            "{}",
+            style(format!(
+                "{:<44} | {:<9} | {:<44} | {:<10}",
+                "Program Id", "Slot", "Authority", "Status"
+            ))
+            .bold()
+        )?;
+        for program in self.programs.iter() {
+            writeln!(
+                f,
+                "{}",
+                &format!(
+                    "{:<44} | {:<9} | {:<44} | {:<10}",
+                    program.program_id, program.last_deploy_slot, program.authority, program.status,
+                )
+            )?;
+        }
         Ok(())
     }
 }
@@ -2023,6 +2338,26 @@ impl fmt::Display for CliUpgradeableProgramClosed {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliUpgradeableProgramExtended {
+    pub program_id: String,
+    pub additional_bytes: u32,
+}
+impl QuietDisplay for CliUpgradeableProgramExtended {}
+impl VerboseDisplay for CliUpgradeableProgramExtended {}
+impl fmt::Display for CliUpgradeableProgramExtended {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Extended Program Id {} by {} bytes",
+            &self.program_id, self.additional_bytes,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliUpgradeableBuffer {
@@ -2092,6 +2427,75 @@ impl fmt::Display for CliUpgradeableBuffers {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliAddressLookupTable {
+    pub lookup_table_address: String,
+    pub authority: Option<String>,
+    pub deactivation_slot: u64,
+    pub last_extended_slot: u64,
+    pub addresses: Vec<String>,
+}
+impl QuietDisplay for CliAddressLookupTable {}
+impl VerboseDisplay for CliAddressLookupTable {}
+impl fmt::Display for CliAddressLookupTable {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln_name_value(f, "Lookup Table Address:", &self.lookup_table_address)?;
+        if let Some(authority) = &self.authority {
+            writeln_name_value(f, "Authority:", authority)?;
+        } else {
+            writeln_name_value(f, "Authority:", "None (frozen)")?;
+        }
+        if self.deactivation_slot == u64::MAX {
+            writeln_name_value(f, "Deactivation Slot:", "None (still active)")?;
+        } else {
+            writeln_name_value(f, "Deactivation Slot:", &self.deactivation_slot.to_string())?;
+        }
+        if self.last_extended_slot == 0 {
+            writeln_name_value(f, "Last Extended Slot:", "None (empty)")?;
+        } else {
+            writeln_name_value(
+                f,
+                "Last Extended Slot:",
+                &self.last_extended_slot.to_string(),
+            )?;
+        }
+        if self.addresses.is_empty() {
+            writeln_name_value(f, "Address Table Entries:", "None (empty)")?;
+        } else {
+            writeln!(f, "{}", style("Address Table Entries:".to_string()).bold())?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "{}",
+                style(format!("  {:<5}  {}", "Index", "Address")).bold()
+            )?;
+            for (index, address) in self.addresses.iter().enumerate() {
+                writeln!(f, "  {index:<5}  {address}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliAddressLookupTableCreated {
+    pub lookup_table_address: String,
+    pub signature: String,
+}
+impl QuietDisplay for CliAddressLookupTableCreated {}
+impl VerboseDisplay for CliAddressLookupTableCreated {}
+impl fmt::Display for CliAddressLookupTableCreated {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln_name_value(f, "Signature:", &self.signature)?;
+        writeln_name_value(f, "Lookup Table Address:", &self.lookup_table_address)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ReturnSignersConfig {
     pub dump_transaction_message: bool,
@@ -2121,10 +2525,10 @@ pub fn return_signers_data(tx: &Transaction, config: &ReturnSignersConfig) -> Cl
     tx.signatures
         .iter()
         .zip(tx.message.account_keys.iter())
-        .zip(verify_results.into_iter())
+        .zip(verify_results)
         .for_each(|((sig, key), res)| {
             if res {
-                signers.push(format!("{}={}", key, sig))
+                signers.push(format!("{key}={sig}"))
             } else if *sig == Signature::default() {
                 absent.push(key.to_string());
             } else {
@@ -2133,7 +2537,7 @@ pub fn return_signers_data(tx: &Transaction, config: &ReturnSignersConfig) -> Cl
         });
     let message = if config.dump_transaction_message {
         let message_data = tx.message_data();
-        Some(base64::encode(&message_data))
+        Some(BASE64_STANDARD.encode(message_data))
     } else {
         None
     };
@@ -2216,7 +2620,7 @@ pub enum CliSignatureVerificationStatus {
 }
 
 impl CliSignatureVerificationStatus {
-    pub fn verify_transaction(tx: &Transaction) -> Vec<Self> {
+    pub fn verify_transaction(tx: &VersionedTransaction) -> Vec<Self> {
         tx.verify_with_results()
             .iter()
             .zip(&tx.signatures)
@@ -2266,10 +2670,14 @@ impl fmt::Display for CliBlock {
             self.encoded_confirmed_block.previous_blockhash
         )?;
         if let Some(block_time) = self.encoded_confirmed_block.block_time {
-            writeln!(f, "Block Time: {:?}", Local.timestamp(block_time, 0))?;
+            writeln!(
+                f,
+                "Block Time: {:?}",
+                Local.timestamp_opt(block_time, 0).unwrap()
+            )?;
         }
         if let Some(block_height) = self.encoded_confirmed_block.block_height {
-            writeln!(f, "Block Height: {:?}", block_height)?;
+            writeln!(f, "Block Height: {block_height:?}")?;
         }
         if !self.encoded_confirmed_block.rewards.is_empty() {
             let mut rewards = self.encoded_confirmed_block.rewards.clone();
@@ -2285,19 +2693,20 @@ impl fmt::Display for CliBlock {
                 let sign = if reward.lamports < 0 { "-" } else { "" };
 
                 total_rewards += reward.lamports;
+                #[allow(clippy::format_in_format_args)]
                 writeln!(
                     f,
                     "  {:<44}  {:^15}  {:>15}  {}  {}",
                     reward.pubkey,
                     if let Some(reward_type) = reward.reward_type {
-                        format!("{}", reward_type)
+                        format!("{reward_type}")
                     } else {
                         "-".to_string()
                     },
                     format!(
                         "{}◎{:<14.9}",
                         sign,
-                        lamports_to_sol(reward.lamports.abs() as u64)
+                        lamports_to_sol(reward.lamports.unsigned_abs())
                     ),
                     if reward.post_balance == 0 {
                         "          -                 -".to_string()
@@ -2312,7 +2721,7 @@ impl fmt::Display for CliBlock {
                     },
                     reward
                         .commission
-                        .map(|commission| format!("{:>9}%", commission))
+                        .map(|commission| format!("{commission:>9}%"))
                         .unwrap_or_else(|| "    -".to_string())
                 )?;
             }
@@ -2322,17 +2731,17 @@ impl fmt::Display for CliBlock {
                 f,
                 "Total Rewards: {}◎{:<12.9}",
                 sign,
-                lamports_to_sol(total_rewards.abs() as u64)
+                lamports_to_sol(total_rewards.unsigned_abs())
             )?;
         }
         for (index, transaction_with_meta) in
             self.encoded_confirmed_block.transactions.iter().enumerate()
         {
-            writeln!(f, "Transaction {}:", index)?;
+            writeln!(f, "Transaction {index}:")?;
             writeln_transaction(
                 f,
                 &transaction_with_meta.transaction.decode().unwrap(),
-                &transaction_with_meta.meta,
+                transaction_with_meta.meta.as_ref(),
                 "  ",
                 None,
                 None,
@@ -2348,10 +2757,10 @@ pub struct CliTransaction {
     pub transaction: EncodedTransaction,
     pub meta: Option<UiTransactionStatusMeta>,
     pub block_time: Option<UnixTimestamp>,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<Slot>,
     #[serde(skip_serializing)]
-    pub decoded_transaction: Transaction,
+    pub decoded_transaction: VersionedTransaction,
     #[serde(skip_serializing)]
     pub prefix: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2366,7 +2775,7 @@ impl fmt::Display for CliTransaction {
         writeln_transaction(
             f,
             &self.decoded_transaction,
-            &self.meta,
+            self.meta.as_ref(),
             &self.prefix,
             if !self.sigverify_status.is_empty() {
                 Some(&self.sigverify_status)
@@ -2399,7 +2808,7 @@ impl VerboseDisplay for CliTransactionConfirmation {
                 "\nTransaction executed in slot {}:",
                 transaction.slot.expect("slot should exist")
             )?;
-            write!(w, "{}", transaction)?;
+            write!(w, "{transaction}")?;
         } else if let Some(confirmation_status) = &self.confirmation_status {
             if confirmation_status != &TransactionConfirmationStatus::Finalized {
                 writeln!(w)?;
@@ -2409,11 +2818,11 @@ impl VerboseDisplay for CliTransactionConfirmation {
                 )?;
             } else if let Some(err) = &self.get_transaction_error {
                 writeln!(w)?;
-                writeln!(w, "Unable to get finalized transaction details: {}", err)?;
+                writeln!(w, "Unable to get finalized transaction details: {err}")?;
             }
         }
         writeln!(w)?;
-        write!(w, "{}", self)
+        write!(w, "{self}")
     }
 }
 
@@ -2423,9 +2832,9 @@ impl fmt::Display for CliTransactionConfirmation {
             None => write!(f, "Not found"),
             Some(confirmation_status) => {
                 if let Some(err) = &self.err {
-                    write!(f, "Transaction failed: {}", err)
+                    write!(f, "Transaction failed: {err}")
                 } else {
-                    write!(f, "{:?}", confirmation_status)
+                    write!(f, "{confirmation_status:?}")
                 }
             }
         }
@@ -2447,7 +2856,11 @@ pub struct CliGossipNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpc_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubsub_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_set: Option<u32>,
 }
 
 impl CliGossipNode {
@@ -2459,7 +2872,9 @@ impl CliGossipNode {
             gossip_port: info.gossip.map(|addr| addr.port()),
             tpu_port: info.tpu.map(|addr| addr.port()),
             rpc_host: info.rpc.map(|addr| addr.to_string()),
+            pubsub_host: info.pubsub.map(|addr| addr.to_string()),
             version: info.version,
+            feature_set: info.feature_set,
         }
     }
 }
@@ -2485,7 +2900,7 @@ impl fmt::Display for CliGossipNode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{:15} | {:44} | {:6} | {:5} | {:21} | {}",
+            "{:15} | {:44} | {:6} | {:5} | {:21} | {:8}| {}",
             unwrap_to_string_or_none(self.ip_address.as_ref()),
             self.identity_label
                 .as_ref()
@@ -2494,6 +2909,7 @@ impl fmt::Display for CliGossipNode {
             unwrap_to_string_or_none(self.tpu_port.as_ref()),
             unwrap_to_string_or_none(self.rpc_host.as_ref()),
             unwrap_to_string_or_default(self.version.as_ref(), "unknown"),
+            unwrap_to_string_or_default(self.feature_set.as_ref(), "unknown"),
         )
     }
 }
@@ -2508,13 +2924,13 @@ impl fmt::Display for CliGossipNodes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(
             f,
-            "IP Address      | Node identifier                              \
-             | Gossip | TPU   | RPC Address           | Version\n\
+            "IP Address      | Identity                                     \
+             | Gossip | TPU   | RPC Address           | Version | Feature Set\n\
              ----------------+----------------------------------------------+\
-             --------+-------+-----------------------+----------------",
+             --------+-------+-----------------------+---------+----------------",
         )?;
         for node in self.0.iter() {
-            writeln!(f, "{}", node)?;
+            writeln!(f, "{node}")?;
         }
         writeln!(f, "Nodes: {}", self.0.len())
     }
@@ -2523,16 +2939,239 @@ impl fmt::Display for CliGossipNodes {
 impl QuietDisplay for CliGossipNodes {}
 impl VerboseDisplay for CliGossipNodes {}
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliPing {
+    pub source_pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_blockhash: Option<String>,
+    #[serde(skip_serializing)]
+    pub blockhash_from_cluster: bool,
+    pub pings: Vec<CliPingData>,
+    pub transaction_stats: CliPingTxStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmation_stats: Option<CliPingConfirmationStats>,
+}
+
+impl fmt::Display for CliPing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln_name_value(f, "Source Account:", &self.source_pubkey)?;
+        if let Some(fixed_blockhash) = &self.fixed_blockhash {
+            let blockhash_origin = if self.blockhash_from_cluster {
+                "fetched from cluster"
+            } else {
+                "supplied from cli arguments"
+            };
+            writeln!(
+                f,
+                "Fixed blockhash is used: {fixed_blockhash} ({blockhash_origin})"
+            )?;
+        }
+        writeln!(f)?;
+        for ping in &self.pings {
+            write!(f, "{ping}")?;
+        }
+        writeln!(f)?;
+        writeln!(f, "--- transaction statistics ---")?;
+        write!(f, "{}", self.transaction_stats)?;
+        if let Some(confirmation_stats) = &self.confirmation_stats {
+            write!(f, "{confirmation_stats}")?;
+        }
+        Ok(())
+    }
+}
+
+impl QuietDisplay for CliPing {}
+impl VerboseDisplay for CliPing {}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliPingData {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing)]
+    pub print_timestamp: bool,
+    pub timestamp: String,
+    pub sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lamports: Option<u64>,
+}
+impl fmt::Display for CliPingData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let (mark, msg) = if let Some(signature) = &self.signature {
+            if self.success {
+                (
+                    CHECK_MARK,
+                    format!(
+                        "{} lamport(s) transferred: seq={:<3} time={:>4}ms signature={}",
+                        self.lamports.unwrap(),
+                        self.sequence,
+                        self.ms.unwrap(),
+                        signature
+                    ),
+                )
+            } else if let Some(error) = &self.error {
+                (
+                    CROSS_MARK,
+                    format!(
+                        "Transaction failed:    seq={:<3} error={:?} signature={}",
+                        self.sequence, error, signature
+                    ),
+                )
+            } else {
+                (
+                    CROSS_MARK,
+                    format!(
+                        "Confirmation timeout:  seq={:<3}             signature={}",
+                        self.sequence, signature
+                    ),
+                )
+            }
+        } else {
+            (
+                CROSS_MARK,
+                format!(
+                    "Submit failed:         seq={:<3} error={:?}",
+                    self.sequence,
+                    self.error.as_ref().unwrap(),
+                ),
+            )
+        };
+
+        writeln!(
+            f,
+            "{}{}{}",
+            if self.print_timestamp {
+                &self.timestamp
+            } else {
+                ""
+            },
+            mark,
+            msg
+        )
+    }
+}
+
+impl QuietDisplay for CliPingData {}
+impl VerboseDisplay for CliPingData {}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliPingTxStats {
+    pub num_transactions: u32,
+    pub num_transaction_confirmed: u32,
+}
+impl fmt::Display for CliPingTxStats {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(
+            f,
+            "{} transactions submitted, {} transactions confirmed, {:.1}% transaction loss",
+            self.num_transactions,
+            self.num_transaction_confirmed,
+            (100.
+                - f64::from(self.num_transaction_confirmed) / f64::from(self.num_transactions)
+                    * 100.)
+        )
+    }
+}
+
+impl QuietDisplay for CliPingTxStats {}
+impl VerboseDisplay for CliPingTxStats {}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliPingConfirmationStats {
+    pub min: f64,
+    pub mean: f64,
+    pub max: f64,
+    pub std_dev: f64,
+}
+impl fmt::Display for CliPingConfirmationStats {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(
+            f,
+            "confirmation min/mean/max/stddev = {:.0}/{:.0}/{:.0}/{:.0} ms",
+            self.min, self.mean, self.max, self.std_dev,
+        )
+    }
+}
+impl QuietDisplay for CliPingConfirmationStats {}
+impl VerboseDisplay for CliPingConfirmationStats {}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CliBalance {
+    pub lamports: u64,
+    #[serde(skip)]
+    pub config: BuildBalanceMessageConfig,
+}
+
+impl QuietDisplay for CliBalance {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        let config = BuildBalanceMessageConfig {
+            show_unit: false,
+            trim_trailing_zeros: true,
+            ..self.config
+        };
+        let balance_message = build_balance_message_with_config(self.lamports, &config);
+        write!(w, "{balance_message}")
+    }
+}
+
+impl VerboseDisplay for CliBalance {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        let config = BuildBalanceMessageConfig {
+            show_unit: true,
+            trim_trailing_zeros: false,
+            ..self.config
+        };
+        let balance_message = build_balance_message_with_config(self.lamports, &config);
+        write!(w, "{balance_message}")
+    }
+}
+
+impl fmt::Display for CliBalance {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let balance_message = build_balance_message_with_config(self.lamports, &self.config);
+        write!(f, "{balance_message}")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliFindProgramDerivedAddress {
+    pub address: String,
+    pub bump_seed: u8,
+}
+
+impl QuietDisplay for CliFindProgramDerivedAddress {}
+impl VerboseDisplay for CliFindProgramDerivedAddress {}
+
+impl fmt::Display for CliFindProgramDerivedAddress {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.address)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use clap::{App, Arg};
-    use solana_sdk::{
-        message::Message,
-        pubkey::Pubkey,
-        signature::{keypair_from_seed, NullSigner, Signature, Signer, SignerError},
-        system_instruction,
-        transaction::Transaction,
+    use {
+        super::*,
+        clap::{App, Arg},
+        solana_sdk::{
+            message::Message,
+            pubkey::Pubkey,
+            signature::{keypair_from_seed, NullSigner, Signature, Signer, SignerError},
+            system_instruction,
+            transaction::Transaction,
+        },
     };
 
     #[test]
@@ -2553,7 +3192,7 @@ mod tests {
             }
 
             fn try_sign_message(&self, _message: &[u8]) -> Result<Signature, SignerError> {
-                Ok(Signature::new(&[1u8; 64]))
+                Ok(Signature::from([1u8; 64]))
             }
 
             fn is_interactive(&self) -> bool {
@@ -2562,10 +3201,10 @@ mod tests {
         }
 
         let present: Box<dyn Signer> = Box::new(keypair_from_seed(&[2u8; 32]).unwrap());
-        let absent: Box<dyn Signer> = Box::new(NullSigner::new(&Pubkey::new(&[3u8; 32])));
-        let bad: Box<dyn Signer> = Box::new(BadSigner::new(Pubkey::new(&[4u8; 32])));
-        let to = Pubkey::new(&[5u8; 32]);
-        let nonce = Pubkey::new(&[6u8; 32]);
+        let absent: Box<dyn Signer> = Box::new(NullSigner::new(&Pubkey::from([3u8; 32])));
+        let bad: Box<dyn Signer> = Box::new(BadSigner::new(Pubkey::from([4u8; 32])));
+        let to = Pubkey::from([5u8; 32]);
+        let nonce = Pubkey::from([6u8; 32]);
         let from = present.pubkey();
         let fee_payer = absent.pubkey();
         let nonce_auth = bad.pubkey();
@@ -2593,11 +3232,7 @@ mod tests {
             CliSignOnlyData {
                 blockhash: blockhash.to_string(),
                 message: None,
-                signers: vec![format!(
-                    "{}={}",
-                    present.pubkey().to_string(),
-                    tx.signatures[1]
-                )],
+                signers: vec![format!("{}={}", present.pubkey(), tx.signatures[1])],
                 absent: vec![absent.pubkey().to_string()],
                 bad_sig: vec![bad.pubkey().to_string()],
             }
@@ -2605,10 +3240,10 @@ mod tests {
 
         let expected_msg = "AwECBwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDgTl3Dqh9\
             F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\
-            BAQEBAYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBQUFBQUFBQUFBQUFBQUFBQUF\
-            BQUFBQUFBQUFBQUFBQUGp9UXGSxWjuCKhF9z0peIzwNcMUWyGrNE2AYuqUAAAAAAAAAAAAAA\
-            AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\
-            BwcCBgMDBQIEBAAAAAYCAQQMAgAAACoAAAAAAAAA"
+            BAQEBAUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBgYGBgYGBgYGBgYGBgYGBgYG\
+            BgYGBgYGBgYGBgYGBgYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAan1RcZLFaO\
+            4IqEX3PSl4jPA1wxRbIas0TYBi6pQAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\
+            BwcCBQMEBgIEBAAAAAUCAQMMAgAAACoAAAAAAAAA"
             .to_string();
         let config = ReturnSignersConfig {
             dump_transaction_message: true,
@@ -2627,11 +3262,7 @@ mod tests {
             CliSignOnlyData {
                 blockhash: blockhash.to_string(),
                 message: Some(expected_msg),
-                signers: vec![format!(
-                    "{}={}",
-                    present.pubkey().to_string(),
-                    tx.signatures[1]
-                )],
+                signers: vec![format!("{}={}", present.pubkey(), tx.signatures[1])],
                 absent: vec![absent.pubkey().to_string()],
                 bad_sig: vec![bad.pubkey().to_string()],
             }
@@ -2729,5 +3360,47 @@ mod tests {
             OutputFormat::from_matches(&matches, "output_format", true),
             OutputFormat::DisplayVerbose
         );
+    }
+
+    #[test]
+    fn test_format_vote_account() {
+        let epoch_rewards = vec![
+            CliEpochReward {
+                percent_change: 11.0,
+                post_balance: 100,
+                commission: Some(1),
+                effective_slot: 100,
+                epoch: 1,
+                amount: 10,
+                block_time: 0,
+                apr: Some(10.0),
+            },
+            CliEpochReward {
+                percent_change: 11.0,
+                post_balance: 100,
+                commission: Some(1),
+                effective_slot: 200,
+                epoch: 2,
+                amount: 12,
+                block_time: 1_000_000,
+                apr: Some(13.0),
+            },
+        ];
+
+        let mut c = CliVoteAccount {
+            account_balance: 10000,
+            validator_identity: Pubkey::default().to_string(),
+            epoch_rewards: Some(epoch_rewards),
+            recent_timestamp: BlockTimestamp::default(),
+            ..CliVoteAccount::default()
+        };
+        let s = format!("{c}");
+        assert_eq!(s, "Account Balance: 0.00001 SOL\nValidator Identity: 11111111111111111111111111111111\nVote Authority: None\nWithdraw Authority: \nCredits: 0\nCommission: 0%\nRoot Slot: ~\nRecent Timestamp: 1970-01-01T00:00:00Z from slot 0\nEpoch Rewards:\n  Epoch   Reward Slot  Time                        Amount              New Balance         Percent Change             APR  Commission\n  1       100          1970-01-01 00:00:00 UTC  ◎0.000000010        ◎0.000000100               11.000%          10.00%          1%\n  2       200          1970-01-12 13:46:40 UTC  ◎0.000000012        ◎0.000000100               11.000%          13.00%          1%\n");
+        println!("{s}");
+
+        c.use_csv = true;
+        let s = format!("{c}");
+        assert_eq!(s, "Account Balance: 0.00001 SOL\nValidator Identity: 11111111111111111111111111111111\nVote Authority: None\nWithdraw Authority: \nCredits: 0\nCommission: 0%\nRoot Slot: ~\nRecent Timestamp: 1970-01-01T00:00:00Z from slot 0\nEpoch Rewards:\nEpoch,Reward Slot,Time,Amount,New Balance,Percent Change,APR,Commission\n1,100,1970-01-01 00:00:00 UTC,0.00000001,0.0000001,11%,10.00%,1%\n2,200,1970-01-12 13:46:40 UTC,0.000000012,0.0000001,11%,13.00%,1%\n");
+        println!("{s}");
     }
 }

@@ -1,14 +1,33 @@
-//! The `hash` module provides functions for creating SHA-256 hashes.
+//! Hashing with the [SHA-256] hash function, and a general [`Hash`] type.
+//!
+//! [SHA-256]: https://en.wikipedia.org/wiki/SHA-2
+//! [`Hash`]: struct@Hash
 
-use crate::sanitize::Sanitize;
-use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
-use sha2::{Digest, Sha256};
-use std::{convert::TryFrom, fmt, mem, str::FromStr};
-use thiserror::Error;
+use {
+    crate::{sanitize::Sanitize, wasm_bindgen},
+    borsh::{BorshDeserialize, BorshSchema, BorshSerialize},
+    bytemuck::{Pod, Zeroable},
+    sha2::{Digest, Sha256},
+    std::{convert::TryFrom, fmt, mem, str::FromStr},
+    thiserror::Error,
+};
 
+/// Size of a hash in bytes.
 pub const HASH_BYTES: usize = 32;
-/// Maximum string length of a base58 encoded hash
+/// Maximum string length of a base58 encoded hash.
 const MAX_BASE58_LEN: usize = 44;
+
+/// A hash; the 32-byte output of a hashing algorithm.
+///
+/// This struct is used most often in `solana-sdk` and related crates to contain
+/// a [SHA-256] hash, but may instead contain a [blake3] hash, as created by the
+/// [`blake3`] module (and used in [`Message::hash`]).
+///
+/// [SHA-256]: https://en.wikipedia.org/wiki/SHA-2
+/// [blake3]: https://github.com/BLAKE3-team/BLAKE3
+/// [`blake3`]: crate::blake3
+/// [`Message::hash`]: crate::message::Message::hash
+#[wasm_bindgen]
 #[derive(
     Serialize,
     Deserialize,
@@ -24,9 +43,12 @@ const MAX_BASE58_LEN: usize = 44;
     PartialOrd,
     Hash,
     AbiExample,
+    Pod,
+    Zeroable,
 )]
+#[borsh(crate = "borsh")]
 #[repr(transparent)]
-pub struct Hash(pub [u8; HASH_BYTES]);
+pub struct Hash(pub(crate) [u8; HASH_BYTES]);
 
 #[derive(Clone, Default)]
 pub struct Hasher {
@@ -43,13 +65,17 @@ impl Hasher {
         }
     }
     pub fn result(self) -> Hash {
-        // At the time of this writing, the sha2 library is stuck on an old version
-        // of generic_array (0.9.0). Decouple ourselves with a clone to our version.
-        Hash(<[u8; HASH_BYTES]>::try_from(self.hasher.finalize().as_slice()).unwrap())
+        Hash(self.hasher.finalize().into())
     }
 }
 
 impl Sanitize for Hash {}
+
+impl From<[u8; HASH_BYTES]> for Hash {
+    fn from(from: [u8; 32]) -> Self {
+        Self(from)
+    }
+}
 
 impl AsRef<[u8]> for Hash {
     fn as_ref(&self) -> &[u8] {
@@ -106,11 +132,11 @@ impl Hash {
 
     /// unique Hash for tests and benchmarks.
     pub fn new_unique() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::atomic_u64::AtomicU64;
         static I: AtomicU64 = AtomicU64::new(1);
 
         let mut b = [0u8; HASH_BYTES];
-        let i = I.fetch_add(1, Ordering::Relaxed);
+        let i = I.fetch_add(1);
         b[0..8].copy_from_slice(&i.to_le_bytes());
         Self::new(&b)
     }
@@ -124,21 +150,18 @@ impl Hash {
 pub fn hashv(vals: &[&[u8]]) -> Hash {
     // Perform the calculation inline, calling this from within a program is
     // not supported
-    #[cfg(not(target_arch = "bpf"))]
+    #[cfg(not(target_os = "solana"))]
     {
         let mut hasher = Hasher::default();
         hasher.hashv(vals);
         hasher.result()
     }
     // Call via a system call to perform the calculation
-    #[cfg(target_arch = "bpf")]
+    #[cfg(target_os = "solana")]
     {
-        extern "C" {
-            fn sol_sha256(vals: *const u8, val_len: u64, hash_result: *mut u8) -> u64;
-        }
         let mut hash_result = [0; HASH_BYTES];
         unsafe {
-            sol_sha256(
+            crate::syscalls::sol_sha256(
                 vals as *const _ as *const u8,
                 vals.len() as u64,
                 &mut hash_result as *mut _ as *mut u8,

@@ -7,44 +7,30 @@ src_root="$(readlink -f "${here}/..")"
 
 cd "${src_root}"
 
+# `cargo-audit` doesn't give us a way to do this nicely, so hammer it is...
+dep_tree_filter="grep -Ev '│|└|├|─'"
+
+while [[ -n $1 ]]; do
+  if [[ $1 = "--display-dependency-trees" ]]; then
+    dep_tree_filter="cat"
+    shift
+  fi
+done
+
 cargo_audit_ignores=(
-  # failure is officially deprecated/unmaintained
-  #
-  # Blocked on multiple upstream crates removing their `failure` dependency.
-  --ignore RUSTSEC-2020-0036
-
-  # `net2` crate has been deprecated; use `socket2` instead
-  #
-  # Blocked on https://github.com/paritytech/jsonrpc/issues/575
-  --ignore RUSTSEC-2020-0016
-
-  # stdweb is unmaintained
-  #
-  # Blocked on multiple upstream crates removing their `stdweb` dependency.
-  --ignore RUSTSEC-2020-0056
-
   # Potential segfault in the time crate
   #
-  # Blocked on multiple crates updating `time` to >= 0.2.23
+  # Blocked on chrono updating `time` to >= 0.2.23
   --ignore RUSTSEC-2020-0071
 
-  # generic-array: arr! macro erases lifetimes
+  # tokio: vulnerability affecting named pipes on Windows
   #
-  # Blocked on libsecp256k1 releasing with upgraded dependencies
-  # https://github.com/paritytech/libsecp256k1/issues/66
-  --ignore RUSTSEC-2020-0146
+  # Exception is a stopgap to unblock CI
+  # https://github.com/solana-labs/solana/issues/29586
+  --ignore RUSTSEC-2023-0001
 
-  # hyper: Lenient `hyper` header parsing of `Content-Length` could allow request smuggling
-  #
-  # Blocked on jsonrpc removing dependency on unmaintained `websocket`
-  # https://github.com/paritytech/jsonrpc/issues/605
-  --ignore RUSTSEC-2021-0078
-
-  # hyper: Integer overflow in `hyper`'s parsing of the `Transfer-Encoding` header leads to data loss
-  #
-  # Blocked on jsonrpc removing dependency on unmaintained `websocket`
-  # https://github.com/paritytech/jsonrpc/issues/605
-  --ignore RUSTSEC-2021-0079
-
+  --ignore RUSTSEC-2022-0093
 )
-scripts/cargo-for-all-lock-files.sh stable audit "${cargo_audit_ignores[@]}"
+scripts/cargo-for-all-lock-files.sh audit "${cargo_audit_ignores[@]}" | $dep_tree_filter
+# we want the `cargo audit` exit code, not `$dep_tree_filter`'s
+exit "${PIPESTATUS[0]}"

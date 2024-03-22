@@ -1,184 +1,110 @@
-use crate::system_instruction_processor;
-use solana_sdk::{
-    feature_set,
-    instruction::InstructionError,
-    process_instruction::{stable_log, InvokeContext, ProcessInstructionWithContext},
-    pubkey::Pubkey,
-    stake, system_program,
+use {
+    solana_program_runtime::invoke_context::BuiltinFunctionWithContext,
+    solana_sdk::{
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, feature_set, pubkey::Pubkey,
+    },
 };
-use std::fmt;
 
-#[cfg(RUSTC_WITH_SPECIALIZATION)]
-use solana_frozen_abi::abi_example::AbiExample;
-
-fn process_instruction_with_program_logging(
-    process_instruction: ProcessInstructionWithContext,
-    first_instruction_account: usize,
-    instruction_data: &[u8],
-    invoke_context: &mut dyn InvokeContext,
-) -> Result<(), InstructionError> {
-    debug_assert_eq!(first_instruction_account, 1);
-
-    let logger = invoke_context.get_logger();
-    let program_id = invoke_context.get_caller()?;
-    stable_log::program_invoke(&logger, program_id, invoke_context.invoke_depth());
-
-    let result = process_instruction(first_instruction_account, instruction_data, invoke_context);
-
-    let program_id = invoke_context.get_caller()?;
-    match &result {
-        Ok(()) => stable_log::program_success(&logger, program_id),
-        Err(err) => stable_log::program_failure(&logger, program_id, err),
-    }
-    result
+/// Transitions of built-in programs at epoch bondaries when features are activated.
+pub struct BuiltinPrototype {
+    pub feature_id: Option<Pubkey>,
+    pub program_id: Pubkey,
+    pub name: &'static str,
+    pub entrypoint: BuiltinFunctionWithContext,
 }
 
-macro_rules! with_program_logging {
-    ($process_instruction:expr) => {
-        |first_instruction_account: usize,
-         instruction_data: &[u8],
-         invoke_context: &mut dyn InvokeContext| {
-            process_instruction_with_program_logging(
-                $process_instruction,
-                first_instruction_account,
-                instruction_data,
-                invoke_context,
-            )
-        }
-    };
-}
-
-#[derive(AbiExample, Debug, Clone)]
-pub enum ActivationType {
-    NewProgram,
-    NewVersion,
-    RemoveProgram,
-}
-
-#[derive(Clone)]
-pub struct Builtin {
-    pub name: String,
-    pub id: Pubkey,
-    pub process_instruction_with_context: ProcessInstructionWithContext,
-}
-
-impl Builtin {
-    pub fn new(
-        name: &str,
-        id: Pubkey,
-        process_instruction_with_context: ProcessInstructionWithContext,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            id,
-            process_instruction_with_context,
-        }
-    }
-}
-
-impl fmt::Debug for Builtin {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Builtin [name={}, id={}]", self.name, self.id)
+impl std::fmt::Debug for BuiltinPrototype {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut builder = f.debug_struct("BuiltinPrototype");
+        builder.field("program_id", &self.program_id);
+        builder.field("name", &self.name);
+        builder.field("feature_id", &self.feature_id);
+        builder.finish()
     }
 }
 
 #[cfg(RUSTC_WITH_SPECIALIZATION)]
-impl AbiExample for Builtin {
+impl solana_frozen_abi::abi_example::AbiExample for BuiltinPrototype {
     fn example() -> Self {
+        // BuiltinPrototype isn't serializable by definition.
+        solana_program_runtime::declare_process_instruction!(MockBuiltin, 0, |_invoke_context| {
+            // Do nothing
+            Ok(())
+        });
         Self {
-            name: String::default(),
-            id: Pubkey::default(),
-            process_instruction_with_context: |_, _, _| Ok(()),
+            feature_id: None,
+            program_id: Pubkey::default(),
+            name: "",
+            entrypoint: MockBuiltin::vm,
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Builtins {
-    /// Builtin programs that are always available
-    pub genesis_builtins: Vec<Builtin>,
-
-    /// Builtin programs activated or deactivated dynamically by feature
-    pub feature_builtins: Vec<(Builtin, Pubkey, ActivationType)>,
-}
-
-/// Builtin programs that are always available
-fn genesis_builtins() -> Vec<Builtin> {
-    vec![
-        Builtin::new(
-            "system_program",
-            system_program::id(),
-            with_program_logging!(system_instruction_processor::process_instruction),
-        ),
-        Builtin::new(
-            "vote_program",
-            solana_vote_program::id(),
-            with_program_logging!(solana_vote_program::vote_instruction::process_instruction),
-        ),
-        Builtin::new(
-            "stake_program",
-            stake::program::id(),
-            with_program_logging!(solana_stake_program::stake_instruction::process_instruction),
-        ),
-        Builtin::new(
-            "config_program",
-            solana_config_program::id(),
-            with_program_logging!(solana_config_program::config_processor::process_instruction),
-        ),
-        Builtin::new(
-            "secp256k1_program",
-            solana_sdk::secp256k1_program::id(),
-            dummy_process_instruction,
-        ),
-    ]
-}
-
-/// place holder for secp256k1, remove when the precompile program is deactivated via feature activation
-fn dummy_process_instruction(
-    _first_instruction_account: usize,
-    _data: &[u8],
-    _invoke_context: &mut dyn InvokeContext,
-) -> Result<(), InstructionError> {
-    Ok(())
-}
-
-/// Builtin programs activated dynamically by feature
-///
-/// Note: If the feature_builtin is intended to replace another builtin program, it must have a new
-/// name.
-/// This is to enable the runtime to determine categorically whether the builtin update has
-/// occurred, and preserve idempotency in Bank::add_native_program across genesis, snapshot, and
-/// normal child Bank creation.
-/// https://github.com/solana-labs/solana/blob/84b139cc94b5be7c9e0c18c2ad91743231b85a0d/runtime/src/bank.rs#L1723
-fn feature_builtins() -> Vec<(Builtin, Pubkey, ActivationType)> {
-    vec![
-        (
-            Builtin::new(
-                "compute_budget_program",
-                solana_sdk::compute_budget::id(),
-                solana_compute_budget_program::process_instruction,
-            ),
-            feature_set::tx_wide_compute_cap::id(),
-            ActivationType::NewProgram,
-        ),
-        // TODO when feature `prevent_calling_precompiles_as_programs` is
-        // cleaned up also remove "secp256k1_program" from the main builtins
-        // list
-        (
-            Builtin::new(
-                "secp256k1_program",
-                solana_sdk::secp256k1_program::id(),
-                dummy_process_instruction,
-            ),
-            feature_set::prevent_calling_precompiles_as_programs::id(),
-            ActivationType::RemoveProgram,
-        ),
-    ]
-}
-
-pub(crate) fn get() -> Builtins {
-    Builtins {
-        genesis_builtins: genesis_builtins(),
-        feature_builtins: feature_builtins(),
-    }
-}
+pub static BUILTINS: &[BuiltinPrototype] = &[
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_system_program::id(),
+        name: "system_program",
+        entrypoint: solana_system_program::system_processor::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_vote_program::id(),
+        name: "vote_program",
+        entrypoint: solana_vote_program::vote_processor::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_stake_program::id(),
+        name: "stake_program",
+        entrypoint: solana_stake_program::stake_instruction::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_config_program::id(),
+        name: "config_program",
+        entrypoint: solana_config_program::config_processor::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: bpf_loader_deprecated::id(),
+        name: "solana_bpf_loader_deprecated_program",
+        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: bpf_loader::id(),
+        name: "solana_bpf_loader_program",
+        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: bpf_loader_upgradeable::id(),
+        name: "solana_bpf_loader_upgradeable_program",
+        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_sdk::compute_budget::id(),
+        name: "compute_budget_program",
+        entrypoint: solana_compute_budget_program::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: None,
+        program_id: solana_sdk::address_lookup_table::program::id(),
+        name: "address_lookup_table_program",
+        entrypoint: solana_address_lookup_table_program::processor::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: Some(feature_set::zk_token_sdk_enabled::id()),
+        program_id: solana_zk_token_sdk::zk_token_proof_program::id(),
+        name: "zk_token_proof_program",
+        entrypoint: solana_zk_token_proof_program::Entrypoint::vm,
+    },
+    BuiltinPrototype {
+        feature_id: Some(feature_set::enable_program_runtime_v2_and_loader_v4::id()),
+        program_id: solana_sdk::loader_v4::id(),
+        name: "loader_v4",
+        entrypoint: solana_loader_v4_program::Entrypoint::vm,
+    },
+];

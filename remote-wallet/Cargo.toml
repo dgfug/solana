@@ -1,35 +1,37 @@
 [package]
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
-edition = "2018"
 name = "solana-remote-wallet"
 description = "Blockchain, Rebuilt for Scale"
-version = "1.9.0"
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
 documentation = "https://docs.rs/solana-remote-wallet"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-base32 = "0.4.0"
-console = "0.14.1"
-dialoguer = "0.8.0"
-hidapi = { version = "1.2.6", default-features = false }
-log = "0.4.14"
-num-derive = { version = "0.3" }
-num-traits = { version = "0.2" }
-parking_lot = "0.11"
-qstring = "0.7.2"
-semver = "1.0"
-solana-sdk = { path = "../sdk", version = "=1.9.0" }
-thiserror = "1.0"
-uriparse = "0.6.3"
+console = { workspace = true }
+dialoguer = { workspace = true }
+hidapi = { workspace = true, optional = true }
+log = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
+parking_lot = { workspace = true }
+qstring = { workspace = true }
+semver = { workspace = true }
+solana-sdk = { workspace = true }
+thiserror = { workspace = true }
+uriparse = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
 
 [features]
-default = ["linux-static-hidraw"]
-linux-static-libusb = ["hidapi/linux-static-libusb"]
-linux-static-hidraw = ["hidapi/linux-static-hidraw"]
-linux-shared-libusb = ["hidapi/linux-shared-libusb"]
+default = ["linux-static-hidraw", "hidapi"]
 linux-shared-hidraw = ["hidapi/linux-shared-hidraw"]
+linux-shared-libusb = ["hidapi/linux-shared-libusb"]
+linux-static-hidraw = ["hidapi/linux-static-hidraw"]
+linux-static-libusb = ["hidapi/linux-static-libusb"]
 
 [[bin]]
 name = "solana-ledger-udev"

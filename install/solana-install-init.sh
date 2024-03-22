@@ -35,7 +35,7 @@ FLAGS:
         --no-modify-path    Don't configure the PATH environment variable
 
 OPTIONS:
-    -d, --data_dir <PATH>    Directory to store install data
+    -d, --data-dir <PATH>    Directory to store install data
     -u, --url <URL>          JSON RPC URL for the solana cluster
     -p, --pubkey <PUBKEY>    Public key of the update manifest
 EOF
@@ -62,17 +62,24 @@ main() {
       esac
     done
 
-    case "$(uname)" in
+    _ostype="$(uname -s)"
+    _cputype="$(uname -m)"
+
+    case "$_ostype" in
     Linux)
-      TARGET=x86_64-unknown-linux-gnu
+      _ostype=unknown-linux-gnu
       ;;
     Darwin)
-      TARGET=x86_64-apple-darwin
+      if [[ $_cputype = arm64 ]]; then
+        _cputype=aarch64
+      fi
+      _ostype=apple-darwin
       ;;
     *)
       err "machine architecture is currently unsupported"
       ;;
     esac
+    TARGET="${_cputype}-${_ostype}"
 
     temp_dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t solana-install-init)"
     ensure mkdir -p "$temp_dir"
